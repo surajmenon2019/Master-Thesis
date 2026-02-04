@@ -28,7 +28,7 @@ CONFIG = {
     "METHODS": ["Cold Start", "Warm Start (ForwardKL)", "Warm Start (ReverseKL)", "Flow Only", "MDN", "SVGD"],
     
     # CHANGE THIS for each run to generate your comparison lines
-    "CURRENT_METHOD": "Flow Only", 
+    "CURRENT_METHOD": "MDN", 
     
     "EPISODES": 100,            
     "STEPS_PER_EPISODE": 1000,  # Long horizon needed for navigation
@@ -74,9 +74,7 @@ class ReplayBuffer:
 # --- SAFETY GYM ADAPTER ---
 class SafetyGymAdapter:
     def __init__(self, env_name):
-        # We assume PointGoal1-v0. If v0 fails, try v1 or check installed version.
         self.env = safety_gymnasium.make(env_name, render_mode=None)
-        # Flatten observations (Lidar + Vels)
         self.state_dim = self.env.observation_space.shape[0]
         self.action_dim = self.env.action_space.shape[0]
         print(f"Initialized {env_name} | State: {self.state_dim} | Action: {self.action_dim}")
@@ -86,7 +84,6 @@ class SafetyGymAdapter:
         return s.astype(np.float32)
 
     def step(self, action):
-        # Unpack Safety Gym return values (6 values)
         ns, r, cost, terminated, truncated, info = self.env.step(action)
         done = terminated or truncated
         
@@ -111,7 +108,6 @@ def load_pretrained_models(ebm, flow, mdn, method):
 
     # 2. Load Flow (The Warm Start)
     if "Warm" in method or "Flow" in method:
-        # Determine suffix based on method string
         suffix = "ReverseKL" if "ReverseKL" in method else "ForwardKL"
         try:
             flow.load_state_dict(torch.load(f"pretrained_flow_{env_name}_{suffix}.pth"))
@@ -207,12 +203,9 @@ def train_agent():
                 # ----------------------------
                 # 2. Train Actor (The "Deep Planning" Horizon)
                 # ----------------------------
-                # Start planning from real states
                 curr_state = bs 
                 
-                # THIS IS THE STUDY: How deep can we go?
-                # For Cold Start, gradients die if this > 1. 
-                # For Warm Start, we should be able to push this to 5, 10, etc.
+                # Thesis: Planning Horizon of 5
                 PLANNING_HORIZON = 5  
                 
                 accumulated_loss = 0
@@ -222,13 +215,11 @@ def train_agent():
                     # a. Policy Action at step h
                     a_plan = actor.sample(curr_state)
                     
-                    # b. World Model Prediction (Differentiable Transition)
+                    # b. World Model Prediction
                     method = CONFIG["CURRENT_METHOD"]
                     next_state = None
                     
-                    # NOTE: We use a SMALL number of Langevin steps here (e.g., 5)
-                    # This relies on the Warm Start to be accurate.
-                    # If Cold Start uses 5 steps, the state will be garbage.
+                    # Refinement Steps
                     LANGEVIN_REFINEMENT = 5 
                     
                     if method == "MDN":
@@ -237,7 +228,11 @@ def train_agent():
                         z = torch.randn_like(curr_state).to(device)
                         next_state = flow.sample(z, context=torch.cat([curr_state, a_plan], dim=1))
                     elif method == "SVGD":
-                        next_state = predict_next_state_svgd(ebm, curr_state, a_plan)
+                        # Updated SVGD call with reduced step size
+                        next_state = predict_next_state_svgd(
+                            ebm, curr_state, a_plan, 
+                            config={"SVGD_STEPS": LANGEVIN_REFINEMENT, "SVGD_STEP_SIZE": 0.0005}
+                        )
                     else: 
                         # Langevin (Cold or Warm)
                         init = None
@@ -245,32 +240,33 @@ def train_agent():
                             z = torch.randn_like(curr_state).to(device)
                             init = flow.sample(z, context=torch.cat([curr_state, a_plan], dim=1))
                         
+                        # CRITICAL FIX: Step size 0.0001 (Compensates for EBM x100 scale)
                         next_state = predict_next_state_langevin(
-                            ebm, curr_state, a_plan, init_state=init, config={"LANGEVIN_STEPS": LANGEVIN_REFINEMENT}
+                            ebm, curr_state, a_plan, init_state=init, 
+                            config={
+                                "LANGEVIN_STEPS": LANGEVIN_REFINEMENT,
+                                "LANGEVIN_STEP_SIZE": 0.0001 
+                            }
                         )
                     
-                    # c. Calculate Loss for this step
-                    # We want to maximize Critic Value (Q) and minimize Energy (Physical Validity)
+                    # c. Calculate Loss
                     q_val = critic(curr_state, a_plan)
+                    
+                    # Energy is scaled 100x in models.py, so this penalty is now SIGNIFICANT (approx 5.0 - 10.0)
+                    # This prevents Flow Dominance in the Policy.
                     energy_penalty = ebm(curr_state, a_plan, next_state).mean()
                     
-                    # Loss = -Q + lambda * Energy
                     step_loss = -q_val.mean() + 0.5 * energy_penalty
                     
-                    # Accumulate discounted loss over time
                     accumulated_loss += gamma_decay * step_loss
                     gamma_decay *= CONFIG["GAMMA"]
                     
-                    # Pass the differentiable state to the next step
                     curr_state = next_state
                 
-                # d. Backpropagate through TIME (through the loop of 5 horizons)
+                # d. Backpropagate
                 actor_opt.zero_grad()
                 accumulated_loss.backward()
-                
-                # Optional: Clip gradients to prevent explosion in deep horizons
                 torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=1.0)
-                
                 actor_opt.step()
             
         print(f"Episode {episode} | Reward: {ep_reward:.2f}")

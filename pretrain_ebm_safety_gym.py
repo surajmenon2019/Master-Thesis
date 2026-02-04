@@ -7,7 +7,8 @@ import os
 # --- IMPORTS ---
 try:
     import safety_gymnasium
-    from models import EnergyBasedModel, RealNVP 
+    # Added MDN
+    from models import EnergyBasedModel, RealNVP, MixtureDensityNetwork 
     from utils_sampling import predict_next_state_langevin
 except ImportError as e:
     print(f"CRITICAL ERROR: Missing modules. {e}")
@@ -15,14 +16,15 @@ except ImportError as e:
     sys.exit(1)
 
 # --- CONFIGURATION ---
-FLOW_TYPE = "ReverseKL"  # Options: "ForwardKL" or "ReverseKL"
+FLOW_TYPE = "ForwardKL"  # Options: "ForwardKL" or "ReverseKL"
 CONFIG = {
     "ENV_NAME": "SafetyPointGoal1-v0", 
-    "PRETRAIN_STEPS": 10000,   # Total training steps
-    "COLLECT_STEPS": 5000,     # Initial data collection
+    "PRETRAIN_STEPS": 10000,   
+    "COLLECT_STEPS": 5000,     
     "BATCH_SIZE": 128,
     "LR_EBM": 1e-4,
     "LR_FLOW": 1e-4,
+    "LR_MDN": 1e-3, # Added specific LR for MDN
     "DEVICE": "cuda" if torch.cuda.is_available() else "cpu",
     "LANGEVIN_STEPS": 30,
     "HIDDEN_DIM": 128
@@ -70,15 +72,15 @@ class SafetyGymAdapter:
         return ns.astype(np.float32), done
 
 def train_unified_models():
-    print(f"\n>>> PRETRAINING START: Safety Gym [{FLOW_TYPE}]")
+    print(f"\n>>> PRETRAINING START: Safety Gym [{FLOW_TYPE}] + MDN")
     device = CONFIG["DEVICE"]
     env_adapter = SafetyGymAdapter(CONFIG["ENV_NAME"])
-    state_dim = env_adapter.state_dim # Needed for Normalization
+    state_dim = env_adapter.state_dim
     
     # 1. Initialize Replay Buffer
     buffer = ReplayBuffer(env_adapter.state_dim, env_adapter.action_dim)
 
-    # 2. Collect Initial Data (Random Policy)
+    # 2. Collect Initial Data
     print(f">>> Collecting {CONFIG['COLLECT_STEPS']} transitions...")
     s = env_adapter.reset()
     for i in range(CONFIG['COLLECT_STEPS']):
@@ -87,34 +89,33 @@ def train_unified_models():
         buffer.add(s, a, ns)
         if done: s = env_adapter.reset()
         else: s = ns
-        if (i+1) % 1000 == 0: print(f"    Collected {i+1} transitions...")
 
     # 3. Models
-    ebm = EnergyBasedModel(env_adapter.state_dim, env_adapter.action_dim, hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
-    flow = RealNVP(data_dim=env_adapter.state_dim, context_dim=env_adapter.state_dim + env_adapter.action_dim, hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
+    ebm = EnergyBasedModel(state_dim, env_adapter.action_dim, hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
+    flow = RealNVP(data_dim=state_dim, context_dim=state_dim + env_adapter.action_dim, hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
+    mdn = MixtureDensityNetwork(state_dim, env_adapter.action_dim, hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
     
     ebm_opt = optim.Adam(ebm.parameters(), lr=CONFIG["LR_EBM"])
     flow_opt = optim.Adam(flow.parameters(), lr=CONFIG["LR_FLOW"])
+    mdn_opt = optim.Adam(mdn.parameters(), lr=CONFIG["LR_MDN"])
 
     # 4. Training Loop
     print("\n>>> Starting Training Loop...")
     for step in range(CONFIG["PRETRAIN_STEPS"]):
-        # Sample Batch
         s, a, real_ns = buffer.sample(CONFIG["BATCH_SIZE"])
         context = torch.cat([s, a], dim=1)
 
         # ==========================
-        # A. TRAIN EBM (CD)
+        # A. TRAIN EBM (Contrastive Divergence)
         # ==========================
         pos_energy = ebm(s, a, real_ns).mean()
         
-        # Negative Sample (Langevin with Warm Start if ReverseKL)
         with torch.no_grad():
             if FLOW_TYPE == "ReverseKL":
                 z = torch.randn(s.shape[0], state_dim).to(device)
                 init_state = flow.sample(z, context=context)
             else:
-                init_state = None # Cold start training for EBM if Flow is just MLE
+                init_state = None 
 
         fake_ns = predict_next_state_langevin(
             ebm, s, a, init_state=init_state, 
@@ -122,8 +123,6 @@ def train_unified_models():
         ).detach()
         
         neg_energy = ebm(s, a, fake_ns).mean()
-        
-        # Loss: Minimize Positive (Real), Maximize Negative (Fake)
         ebm_loss = pos_energy - neg_energy + (pos_energy**2 + neg_energy**2) * 0.1
         
         ebm_opt.zero_grad(); ebm_loss.backward(); ebm_opt.step()
@@ -132,40 +131,54 @@ def train_unified_models():
         # B. TRAIN FLOW
         # ==========================
         if FLOW_TYPE == "ForwardKL":
-            # MLE: Maximize log_prob of real data
-            # FIX 1: Normalize by dimension to keep gradients stable
+            # Normalized MLE
             log_prob = flow.log_prob(real_ns, context=context)
             loss_flow = -log_prob.mean() / state_dim 
-
         else: 
-            # ReverseKL: Minimize KL(q || p) = E_q [ log(q) + E(x) ]
+            # Normalized ReverseKL with fixed signs
             z = torch.randn(s.shape[0], state_dim).to(device)
             fake = flow.sample(z, context=context)
             
-            # Freeze EBM for this step
             for p in ebm.parameters(): p.requires_grad = False
             energy = ebm(s, a, fake).mean()
             for p in ebm.parameters(): p.requires_grad = True
             
             log_p = flow.log_prob(fake, context=context)
-            
-            # FIX 2: Normalize LogProb by Dimension
             avg_log_p = log_p.mean() / state_dim
-            
-            # FIX 3: SIGN FLIP (Minimize both Energy and Entropy-Penalty)
-            # We want High Entropy (Spread) -> Minimize LogProb
-            # We want Low Energy (Safe) -> Minimize Energy
             loss_flow = energy + avg_log_p 
 
         flow_opt.zero_grad(); loss_flow.backward(); flow_opt.step()
+
+        # ==========================
+        # C. TRAIN MDN (Strictly Normalized)
+        # ==========================
+        pi, mu, sigma = mdn(s, a)
+        
+        # Expand target for mixture broadcasting
+        target = real_ns.unsqueeze(1).expand_as(mu)
+        
+        # 1. Log Probability per component
+        dist = torch.distributions.Normal(mu, sigma)
+        # Sum over dimensions to get prob of full state vector (Batch, K)
+        log_prob_components = dist.log_prob(target).sum(dim=-1) 
+        
+        # 2. LogSumExp for Mixture
+        log_pi = torch.log_softmax(pi, dim=1)
+        log_likelihood = torch.logsumexp(log_pi + log_prob_components, dim=1)
+        
+        # 3. NORMALIZE by dimension so it matches Flow scale (Approx 1.0 instead of 60.0)
+        loss_mdn = -log_likelihood.mean() / state_dim
+        
+        mdn_opt.zero_grad(); loss_mdn.backward(); mdn_opt.step()
         
         if step % 1000 == 0:
-            print(f"Step {step} | EBM Loss: {ebm_loss.item():.4f} | Flow Loss: {loss_flow.item():.4f}")
+            print(f"Step {step} | EBM: {ebm_loss.item():.4f} | Flow: {loss_flow.item():.4f} | MDN: {loss_mdn.item():.4f}")
 
     # 5. Save
     torch.save(ebm.state_dict(), f"pretrained_ebm_{CONFIG['ENV_NAME']}.pth")
     torch.save(flow.state_dict(), f"pretrained_flow_{CONFIG['ENV_NAME']}_{FLOW_TYPE}.pth")
-    print("\n>>> SUCCESS. Saved models.")
+    torch.save(mdn.state_dict(), f"pretrained_mdn_{CONFIG['ENV_NAME']}.pth")
+    print("\n>>> SUCCESS. Saved models (EBM, Flow, MDN).")
 
 if __name__ == "__main__":
     train_unified_models()
