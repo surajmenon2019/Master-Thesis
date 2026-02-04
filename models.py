@@ -68,7 +68,7 @@ class EnergyBasedModel(nn.Module):
 
     def forward(self, state, action, next_state):
         x = torch.cat([state, action, next_state], dim=1)
-        return self.net(x)
+        return 100 * self.net(x)
 
 class RealNVP(nn.Module):
     """

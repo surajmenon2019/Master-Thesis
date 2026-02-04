@@ -186,8 +186,8 @@ def run_benchmark():
     ax.legend()
     
     plt.tight_layout()
-    plt.savefig("thesis_horizon_benchmark.png", dpi=300)
-    print("\n>>> SUCCESS. Plot saved to 'thesis_horizon_benchmark.png'")
+    plt.savefig("thesis_horizon_benchmark2.png", dpi=300)
+    print("\n>>> SUCCESS. Plot saved to 'thesis_horizon_benchmark2.png'")
 
 if __name__ == "__main__":
     run_benchmark()

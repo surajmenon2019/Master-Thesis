@@ -28,7 +28,7 @@ CONFIG = {
     "METHODS": ["Cold Start", "Warm Start (ForwardKL)", "Warm Start (ReverseKL)", "Flow Only", "MDN", "SVGD"],
     
     # CHANGE THIS for each run to generate your comparison lines
-    "CURRENT_METHOD": "Warm Start (ReverseKL)", 
+    "CURRENT_METHOD": "Flow Only", 
     
     "EPISODES": 100,            
     "STEPS_PER_EPISODE": 1000,  # Long horizon needed for navigation
