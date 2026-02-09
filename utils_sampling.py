@@ -150,5 +150,7 @@ def predict_next_state_svgd(model, state, action, config=None):
         # D. Step
         particles = particles + cfg["SVGD_STEP_SIZE"] * phi
     
-    # 3. Return Mean Particle
-    return particles.mean(dim=1)
+    random_idx = torch.randint(0, num_particles, (B,), device=state.device)
+    selected_particle = particles[torch.arange(B), random_idx]
+    
+    return selected_particle

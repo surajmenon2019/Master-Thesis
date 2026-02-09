@@ -68,7 +68,7 @@ class EnergyBasedModel(nn.Module):
 
     def forward(self, state, action, next_state):
         x = torch.cat([state, action, next_state], dim=1)
-        return 100 * self.net(x)
+        return self.net(x)
 
 class RealNVP(nn.Module):
     """
@@ -166,12 +166,16 @@ class MixtureDensityNetwork(nn.Module):
         pi_logits, mu, sigma = self.forward(state, action)
         
         # 1. Soft Categorical (Gumbel-Softmax)
+        # Shape: (B, K, 1)
         weights = F.gumbel_softmax(pi_logits, tau=1.0, hard=False).unsqueeze(-1)
         
-        # 2. Mixture
-        mixed_mu = (weights * mu).sum(dim=1)
-        mixed_sigma = (weights * sigma).sum(dim=1)
+        # 2. Sample from ALL components independently
+        # Shape: (B, K, D)
+        z = torch.randn_like(mu)
+        component_samples = mu + sigma * z
         
-        # 3. Sample
-        noise = torch.randn_like(mixed_mu)
-        return mixed_mu + mixed_sigma * noise
+        # 3. Mix the SAMPLES (not the parameters)
+        # This preserves multimodality via the weights selection
+        output = (weights * component_samples).sum(dim=1)
+        
+        return output
