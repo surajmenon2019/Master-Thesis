@@ -32,7 +32,7 @@ CONFIG = {
     ],
     
     # Training
-    "TOTAL_STEPS": 10000,      # Total training steps per agent
+    "TOTAL_STEPS": 50000,      # Total training steps per agent
     "BATCH_SIZE": 256,         # Batch size for imagined rollouts
     "HORIZON": 5,              # H for imagined rollouts
     
@@ -330,13 +330,17 @@ def update_critic(critic, critic_target, states, actions, lambda_values, optimiz
     return loss.item()
 
 # --- ACTOR UPDATE ---
-def update_actor(actor, critic, states, optimizer):
-    """Update actor to maximize expected value"""
+def update_actor(actor, critic, states, actions, optimizer):
+    """
+    Update actor to maximize expected value
+    Uses actions from trajectory generation (supervisor feedback fix)
+    """
     batch_size, horizon, state_dim = states.shape
     states_flat = states.reshape(-1, state_dim)
+    actions_flat = actions.reshape(-1, actions.shape[-1])
     
-    actions = actor.sample(states_flat)
-    values = critic(states_flat, actions)
+    # Use actions from trajectory 
+    values = critic(states_flat, actions_flat)
     
     loss = -values.mean()
     
@@ -492,8 +496,8 @@ def train_agent(agent_type, env, state_buffer):
             # Update critic (Line 118-120)
             critic_loss = update_critic(critic, critic_target, states, actions, lambda_values, critic_opt)
             
-            # Update actor (Line 106)
-            actor_loss = update_actor(actor, critic, states, actor_opt)
+            # Update actor (Line 106) - reuse actions from trajectory
+            actor_loss = update_actor(actor, critic, states, actions, actor_opt)
             
             # Soft update of target critic
             for param, target_param in zip(critic.parameters(), critic_target.parameters()):
