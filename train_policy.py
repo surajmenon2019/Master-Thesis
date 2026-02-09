@@ -32,7 +32,7 @@ CONFIG = {
     ],
     
     # Training
-    "TOTAL_STEPS": 50000,      # Total training steps per agent
+    "TOTAL_STEPS": 40000,      # Total training steps per agent
     "BATCH_SIZE": 256,         # Batch size for imagined rollouts
     "HORIZON": 5,              # H for imagined rollouts
     
@@ -313,7 +313,7 @@ def update_critic(critic, critic_target, states, actions, lambda_values, optimiz
     """Update critic (state-action value function)"""
     batch_size, horizon, state_dim = states.shape
     states_flat = states.reshape(-1, state_dim)
-    actions_flat = actions.reshape(-1, actions.shape[-1])
+    actions_flat = actions.reshape(-1, actions.shape[-1]).detach()  # Detach to prevent graph reuse!
     
     # Critic predicts Q(s,a)
     values = critic(states_flat, actions_flat)
