@@ -7,9 +7,9 @@ import os
 # --- IMPORTS ---
 try:
     import safety_gymnasium
-    # Added MDN
-    from models import EnergyBasedModel, RealNVP, MixtureDensityNetwork 
-    from utils_sampling import predict_next_state_langevin
+    # InfoNCE: BilinearEBM, Flow, MDN
+    from models import BilinearEBM, RealNVP, MixtureDensityNetwork 
+    import torch.nn.functional as F
 except ImportError as e:
     print(f"CRITICAL ERROR: Missing modules. {e}")
     print("Run: pip install safety-gymnasium")
@@ -24,10 +24,14 @@ CONFIG = {
     "BATCH_SIZE": 128,
     "LR_EBM": 1e-4,
     "LR_FLOW": 1e-4,
-    "LR_MDN": 1e-3, # Added specific LR for MDN
+    "LR_MDN": 1e-3,
     "DEVICE": "cuda" if torch.cuda.is_available() else "cpu",
+    "HIDDEN_DIM": 128,
+    # InfoNCE-specific parameters
+    "NUM_NEGATIVES": 128,  # Number of random negatives for InfoNCE (was 512, reduced for speed)
+    "TEMPERATURE": 0.1,    # InfoNCE temperature
+    # Langevin only needed for Flow warm-start (not EBM training)
     "LANGEVIN_STEPS": 30,
-    "HIDDEN_DIM": 128
 }
 
 # --- REPLAY BUFFER ---
@@ -71,6 +75,68 @@ class SafetyGymAdapter:
         done = terminated or truncated
         return ns.astype(np.float32), done
 
+# --- INFONCE LOSS FUNCTION ---
+def infonce_loss(ebm, state, action, pos_next_state, buffer, 
+                 num_negatives=512, temperature=0.1, explicit_negatives=None):
+    """
+    InfoNCE loss for training BilinearEBM dynamics models.
+    Supports explicit negatives (e.g., from Langevin sampling) for Hard Negative Mining.
+    
+    Args:
+        ebm: BilinearEBM model
+        state: (B, state_dim)
+        action: (B, action_dim)
+        pos_next_state: (B, state_dim) - real next states
+        buffer: ReplayBuffer with .next_states and .size
+        num_negatives: Number of random negatives per positive
+        temperature: Temperature for softmax (lower = harder)
+        explicit_negatives: Optional (B, M, state_dim) tensor of hard negatives
+    
+    Returns:
+        loss: Scalar InfoNCE loss
+        metrics: Dict with E_pos and E_neg for logging
+    """
+    B = state.shape[0]
+    device = state.device
+    
+    # 1. Positive energy: E(s,a,s'_real) - should be HIGH
+    E_pos = ebm(state, action, pos_next_state)  # (B,)
+    
+    # 2. Sample negatives from buffer
+    neg_indices = np.random.randint(0, buffer.size, size=(B, num_negatives))
+    neg_next_states = torch.tensor(
+        buffer.next_states[neg_indices], 
+        dtype=torch.float32, 
+        device=device
+    )  # (B, K, state_dim)
+    
+    # 3. Add explicit negatives if provided (Hard Negative Mining)
+    if explicit_negatives is not None:
+        neg_next_states = torch.cat([neg_next_states, explicit_negatives], dim=1)
+        num_negatives += explicit_negatives.shape[1]
+    
+    # 4. Expand state/action for all negatives
+    state_exp = state.unsqueeze(1).expand(B, num_negatives, -1)  # (B, K_total, state_dim)
+    action_exp = action.unsqueeze(1).expand(B, num_negatives, -1)  # (B, K_total, action_dim)
+    
+    # 5. Negative energies: E(s,a,s'_neg) - should be LOW
+    E_neg = ebm(state_exp, action_exp, neg_next_states)  # (B, K_total)
+    
+    # 6. InfoNCE loss: -log(exp(E_pos/T) / (exp(E_pos/T) + sum(exp(E_neg/T))))
+    # Numerically stable version using cross-entropy
+    logits = torch.cat([E_pos.unsqueeze(1), E_neg], dim=1) / temperature  # (B, K_total+1)
+    labels = torch.zeros(B, dtype=torch.long, device=device)  # Positive at index 0
+    loss = F.cross_entropy(logits, labels)
+    
+    # 7. Metrics for logging
+    metrics = {
+        'E_pos': E_pos.mean().item(),
+        'E_neg': E_neg.mean().item(),
+        'E_gap': (E_pos.mean() - E_neg.mean()).item()
+    }
+    
+    return loss, metrics
+
 def train_unified_models():
     print(f"\n>>> PRETRAINING START: Safety Gym [{FLOW_TYPE}] + MDN")
     device = CONFIG["DEVICE"]
@@ -91,7 +157,7 @@ def train_unified_models():
         else: s = ns
 
     # 3. Models
-    ebm = EnergyBasedModel(state_dim, env_adapter.action_dim, hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
+    ebm = BilinearEBM(state_dim, env_adapter.action_dim, hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
     flow = RealNVP(data_dim=state_dim, context_dim=state_dim + env_adapter.action_dim, hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
     mdn = MixtureDensityNetwork(state_dim, env_adapter.action_dim, hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
     
@@ -101,31 +167,23 @@ def train_unified_models():
 
     # 4. Training Loop
     print("\n>>> Starting Training Loop...")
+    print(f">>> EBM Training: InfoNCE (no MCMC!) with {CONFIG['NUM_NEGATIVES']} negatives")
     for step in range(CONFIG["PRETRAIN_STEPS"]):
         s, a, real_ns = buffer.sample(CONFIG["BATCH_SIZE"])
         context = torch.cat([s, a], dim=1)
 
         # ==========================
-        # A. TRAIN EBM (Contrastive Divergence)
+        # A. TRAIN EBM (InfoNCE - NO LANGEVIN!)
         # ==========================
-        pos_energy = ebm(s, a, real_ns).mean()
+        ebm_loss, ebm_metrics = infonce_loss(
+            ebm, s, a, real_ns, buffer,
+            num_negatives=CONFIG["NUM_NEGATIVES"],
+            temperature=CONFIG["TEMPERATURE"]
+        )
         
-        with torch.no_grad():
-            if FLOW_TYPE == "ReverseKL":
-                z = torch.randn(s.shape[0], state_dim).to(device)
-                init_state = flow.sample(z, context=context)
-            else:
-                init_state = None 
-
-        fake_ns = predict_next_state_langevin(
-            ebm, s, a, init_state=init_state, 
-            config={"LANGEVIN_STEPS": CONFIG["LANGEVIN_STEPS"]}
-        ).detach()
-        
-        neg_energy = ebm(s, a, fake_ns).mean()
-        ebm_loss = pos_energy - neg_energy + (pos_energy**2 + neg_energy**2) * 0.1
-        
-        ebm_opt.zero_grad(); ebm_loss.backward(); ebm_opt.step()
+        ebm_opt.zero_grad()
+        ebm_loss.backward()
+        ebm_opt.step()
 
         # ==========================
         # B. TRAIN FLOW
@@ -172,7 +230,7 @@ def train_unified_models():
         mdn_opt.zero_grad(); loss_mdn.backward(); mdn_opt.step()
         
         if step % 1000 == 0:
-            print(f"Step {step} | EBM: {ebm_loss.item():.4f} | Flow: {loss_flow.item():.4f} | MDN: {loss_mdn.item():.4f}")
+            print(f"Step {step} | EBM: {ebm_loss.item():.4f} (E_pos: {ebm_metrics['E_pos']:.2f}, E_neg: {ebm_metrics['E_neg']:.2f}, gap: {ebm_metrics['E_gap']:.2f}) | Flow: {loss_flow.item():.4f} | MDN: {loss_mdn.item():.4f}")
 
     # 5. Save
     torch.save(ebm.state_dict(), f"pretrained_ebm_{CONFIG['ENV_NAME']}.pth")
