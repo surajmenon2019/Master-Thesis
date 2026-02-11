@@ -70,6 +70,88 @@ class EnergyBasedModel(nn.Module):
         x = torch.cat([state, action, next_state], dim=1)
         return self.net(x)
 
+class BilinearEBM(nn.Module):
+    """
+    Bilinear Energy-Based Model for InfoNCE training.
+    
+    ENERGY CONVENTION: Higher energy = more compatible (contrastive learning)
+    E(s, a, s') = g(s,a)^T · h(s')
+    
+    This is DIFFERENT from standard EBM where lower energy = higher probability.
+    Used with InfoNCE loss for training dynamics models without MCMC.
+    
+    Key differences from EnergyBasedModel:
+    - Architecture: Bilinear (dot product) vs concatenation
+    - Convention: Higher energy = better vs lower energy = better
+    - Training: InfoNCE (contrastive) vs CD (energy difference)
+    """
+    def __init__(self, state_dim, action_dim, hidden_dim=128):
+        super(BilinearEBM, self).__init__()
+        
+        # Context encoder: g(s, a) → hidden_dim
+        self.context_encoder = nn.Sequential(
+            nn.Linear(state_dim + action_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        # Next state encoder: h(s') → hidden_dim
+        self.next_state_encoder = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+    
+    def forward(self, state, action, next_state):
+        """
+        Compute energy E(s,a,s') = g(s,a)^T · h(s')
+        
+        Args:
+            state: (B, state_dim) or (B, K, state_dim)
+            action: (B, action_dim) or (B, K, action_dim)
+            next_state: (B, state_dim) or (B, K, state_dim)
+        
+        Returns:
+            energy: (B,) or (B, K) - HIGHER = more compatible
+        """
+        # Handle batch of states or batch of negatives
+        if state.dim() == 3:  # (B, K, state_dim) - batch of negatives
+            B, K, state_dim = state.shape
+            state_flat = state.reshape(B * K, state_dim)
+            action_flat = action.reshape(B * K, -1)
+            next_state_flat = next_state.reshape(B * K, -1)
+            
+            context = torch.cat([state_flat, action_flat], dim=-1)
+            g_out = self.context_encoder(context)  # (B*K, hidden_dim)
+            h_out = self.next_state_encoder(next_state_flat)  # (B*K, hidden_dim)
+            
+            # Normalize embeddings to prevent energy explosion
+            g_out = F.normalize(g_out, p=2, dim=-1)
+            h_out = F.normalize(h_out, p=2, dim=-1)
+            
+            energy = (g_out * h_out).sum(dim=-1)  # (B*K,) - dot product (Cosine Similarity)
+            # Scale energy to allow for sharper distributions (optional, but helpful)
+            energy = energy * 10.0 
+            
+            energy = energy.reshape(B, K)  # (B, K)
+        else:  # (B, state_dim) - single batch
+            context = torch.cat([state, action], dim=-1)
+            g_out = self.context_encoder(context)  # (B, hidden_dim)
+            h_out = self.next_state_encoder(next_state)  # (B, hidden_dim)
+            
+            # Normalize embeddings
+            g_out = F.normalize(g_out, p=2, dim=-1)
+            h_out = F.normalize(h_out, p=2, dim=-1)
+            
+            energy = (g_out * h_out).sum(dim=-1)  # (B,) - dot product
+            energy = energy * 10.0
+        
+        return energy
+
 class RealNVP(nn.Module):
     """
     Robust RealNVP that handles data dimensions safely.
@@ -179,3 +261,30 @@ class MixtureDensityNetwork(nn.Module):
         output = (weights * component_samples).sum(dim=1)
         
         return output
+
+class RewardModel(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=128):
+        super(RewardModel, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim + action_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+    def forward(self, state, action):
+        x = torch.cat([state, action], dim=1)
+        return self.net(x)
+
+class ValueNetwork(nn.Module):
+    def __init__(self, state_dim, hidden_dim=128):
+        super(ValueNetwork, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+    def forward(self, state):
+        return self.net(state)

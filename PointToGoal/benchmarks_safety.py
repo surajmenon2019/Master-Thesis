@@ -8,8 +8,11 @@ import os
 # --- IMPORTS ---
 try:
     import safety_gymnasium
-    from models import EnergyBasedModel, RealNVP, MixtureDensityNetwork
-    from utils_sampling import predict_next_state_langevin, predict_next_state_svgd
+    from models import BilinearEBM, RealNVP, MixtureDensityNetwork
+    from utils_sampling import (
+        predict_next_state_langevin_adaptive,
+        predict_next_state_svgd_adaptive
+    )
 except ImportError as e:
     print(f"CRITICAL: Missing modules. {e}")
     sys.exit(1)
@@ -49,13 +52,13 @@ class SafetyGymAdapter:
 # --- 2. WEIGHT LOADING (UPDATED) ---
 def load_weights(model, method, env_name):
     try:
-        if isinstance(model, EnergyBasedModel):
-            model.load_state_dict(torch.load(f"pretrained_ebm_{env_name}.pth"))
+        if isinstance(model, BilinearEBM):
+            model.load_state_dict(torch.load(f"pretrained_ebm_{env_name}.pth", map_location="cpu", weights_only=False))
         elif isinstance(model, RealNVP):
             suffix = "ForwardKL" if "ForwardKL" in method or "Flow" in method else "ReverseKL"
-            model.load_state_dict(torch.load(f"pretrained_flow_{env_name}_{suffix}.pth"))
+            model.load_state_dict(torch.load(f"pretrained_flow_{env_name}_{suffix}.pth", map_location="cpu", weights_only=False))
         elif isinstance(model, MixtureDensityNetwork):
-            model.load_state_dict(torch.load(f"pretrained_mdn_{env_name}.pth"))
+            model.load_state_dict(torch.load(f"pretrained_mdn_{env_name}.pth", map_location="cpu", weights_only=False))
             
         print(f"-> Loaded weights for {method}")
     except FileNotFoundError:
@@ -67,7 +70,8 @@ def run_benchmark():
     env_adapter = SafetyGymAdapter(CONFIG["ENV_NAME"], device)
     
     # Initialize Models
-    ebm = EnergyBasedModel(env_adapter.state_dim, env_adapter.action_dim, hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
+    # BilinearEBM uses higher=better energy convention (trained with InfoNCE)
+    ebm = BilinearEBM(env_adapter.state_dim, env_adapter.action_dim, hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
     flow = RealNVP(env_adapter.state_dim, context_dim=env_adapter.state_dim + env_adapter.action_dim, hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
     mdn = MixtureDensityNetwork(env_adapter.state_dim, env_adapter.action_dim, hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
     
@@ -108,16 +112,27 @@ def run_benchmark():
                     z = torch.randn_like(curr_state).to(device)
                     ns_pred = flow.sample(z, context=torch.cat([curr_state, action], dim=1))
                 elif method == "SVGD":
-                    ns_pred = predict_next_state_svgd(ebm, curr_state, action, config={"SVGD_STEPS": INNER_STEPS})
+                    # BilinearEBM: use gradient ASCENT (higher energy = better)
+                    ns_pred = predict_next_state_svgd_adaptive(
+                        ebm, curr_state, action,
+                        use_ascent=True,  # BilinearEBM needs ascent
+                        config={"SVGD_STEPS": INNER_STEPS}
+                    )
                 else: # Langevin
                     init = None
                     if "Warm" in method:
                         z = torch.randn_like(curr_state).to(device)
                         init = flow.sample(z, context=torch.cat([curr_state, action], dim=1))
                     
-                    ns_pred = predict_next_state_langevin(
-                        ebm, curr_state, action, init_state=init, 
-                        config={"LANGEVIN_STEPS": INNER_STEPS}
+                    # BilinearEBM: use gradient ASCENT (higher energy = better)
+                    ns_pred = predict_next_state_langevin_adaptive(
+                        ebm, curr_state, action,
+                        init_state=init,
+                        use_ascent=True,
+                        config={
+                            "LANGEVIN_STEPS": INNER_STEPS,
+                            "LANGEVIN_NOISE_SCALE": 0.0  # No noise for gradient flow
+                        }
                     )
                 
                 curr_state = ns_pred
