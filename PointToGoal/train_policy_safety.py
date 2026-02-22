@@ -11,7 +11,7 @@ from collections import deque
 # --- IMPORTS ---
 try:
     import safety_gymnasium
-    from models import Actor, Critic, BilinearEBM, RealNVP, MixtureDensityNetwork
+    from models import Actor, Critic, BilinearEBM, RealNVP, MixtureDensityNetwork, ValueNetwork, RewardModel
     from utils_sampling import (
         predict_next_state_langevin_adaptive, 
         predict_next_state_svgd_adaptive
@@ -59,6 +59,9 @@ CONFIG = {
     "LANGEVIN_STEP_SIZE": 0.05,
     "LANGEVIN_NOISE_SCALE": 0.01,
     
+    # Entropy regularization (MaxEnt RL)
+    "ENTROPY_COEFF": 0.01,
+    
     # Logging
     "LOG_INTERVAL": 100,
     "EVAL_INTERVAL": 1000,
@@ -68,27 +71,7 @@ CONFIG = {
     "HIDDEN_DIM": 128,
 }
 
-# --- REWARD MODEL (LAMBDA Line 112-113) ---
-class RewardModel(nn.Module):
-    """
-    Reward decoder: r̂(s,a) 
-    Trained on real environment data (Line 113)
-    Used in imagined rollouts (Line 149)
-    """
-    def __init__(self, state_dim, action_dim, hidden_dim=128):
-        super(RewardModel, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(state_dim + action_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
-        )
-    
-    def forward(self, state, action):
-        """Predict reward given state and action"""
-        x = torch.cat([state, action], dim=1)
-        return self.net(x)
+# RewardModel imported from models.py
 
 # --- LAMBDA-STYLE TRAJECTORY BUFFER ---
 class TrajectoryBuffer:
@@ -330,121 +313,6 @@ class Agent:
                 }
             )
 
-# --- IMAGINED ROLLOUT WITH REWARD MODEL (Line 149) ---
-def generate_imagined_rollout(agent, actor, reward_model, initial_states, horizon, device):
-    """
-    Generate imagined trajectories with PREDICTED rewards
-    Line 149: stacked['reward'] = self._reward_decoder(stacked['features']).mean()
-    """
-    batch_size = initial_states.shape[0]
-    
-    states_list = []
-    actions_list = []
-    rewards_list = []
-    next_states_list = [] # New: Collect next states
-    
-    current_state = initial_states
-    
-    for t in range(horizon):
-        # Sample action from policy
-        action = actor.sample(current_state)
-        
-        # Predict reward using reward model (Line 149!)
-        predicted_reward = reward_model(current_state, action)
-        
-        # Predict next state using world model
-        next_state = agent.predict_next_state(current_state, action)
-        
-        # Clip next state to prevent explosions
-        next_state = torch.clamp(next_state, -10.0, 10.0)
-        
-        states_list.append(current_state)
-        actions_list.append(action)
-        rewards_list.append(predicted_reward)
-        next_states_list.append(next_state) # Collect next state
-        
-        current_state = next_state
-    
-    states = torch.stack(states_list, dim=1)
-    actions = torch.stack(actions_list, dim=1)
-    rewards = torch.stack(rewards_list, dim=1)
-    next_states = torch.stack(next_states_list, dim=1) # (B, H, state_dim)
-    
-    # Debug: Check if reward model predicts anything useful
-    if np.random.rand() < 0.05: # Log 5% of the time to avoid spam
-        print(f"    [Rollout Rewards] Mean: {rewards.mean().item():.6f} | Max: {rewards.max().item():.6f} | Min: {rewards.min().item():.6f}")
-        
-    dones = torch.zeros(batch_size, horizon, 1).to(device)
-    
-    return states, actions, rewards, next_states, dones
-
-# --- CRITIC UPDATE ---
-def update_critic(critic, critic_target, states, actions, lambda_values, optimizer):
-    """Update critic (state-action value function)"""
-    batch_size, horizon, state_dim = states.shape
-    states_flat = states.reshape(-1, state_dim)
-    actions_flat = actions.reshape(-1, actions.shape[-1]).detach()  # Detach to prevent graph reuse!
-    
-    # Critic predicts Q(s,a)
-    values = critic(states_flat, actions_flat)
-    values = values.reshape(batch_size, horizon)
-    
-    # TD-lambda targets
-    loss = F.mse_loss(values, lambda_values.detach())
-    
-    optimizer.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
-    optimizer.step()
-    
-    return loss.item()
-
-# --- ACTOR UPDATE ---
-def update_actor(actor, critic, states, actions, optimizer):
-    """
-    Update actor to maximize expected value.
-    
-    Re-samples actions (not from trajectory) because rollout actions 
-    lack gradients due to frozen world model context.
-    """
-    batch_size, horizon, state_dim = states.shape
-    states_flat = states.reshape(-1, state_dim).detach()  # Detach states, only train actor
-    
-    # Re-sample actions WITH gradients (rollout actions have no gradients)
-    actions_new = actor.sample(states_flat)
-    values = critic(states_flat, actions_new)
-    
-    loss = -values.mean()
-    
-    optimizer.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
-    optimizer.step()
-    
-    return loss.item()
-
-# --- REWARD MODEL UPDATE (Line 113) ---
-def update_reward_model(reward_model, buffer, optimizer, batch_size=256):
-    """
-    Train reward decoder on real environment data
-    Line 113: log_p_rewards = tf.reduce_mean(self._reward_decoder(features).log_prob(batch['reward']))
-    """
-    batch = buffer.sample_for_reward_training(batch_size)
-    if batch is None:
-        return 0.0
-    
-    # Predict rewards
-    predicted_rewards = reward_model(batch['states'], batch['actions'])
-    
-    # MSE loss with real rewards
-    loss = F.mse_loss(predicted_rewards, batch['rewards'])
-    
-    optimizer.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(reward_model.parameters(), 1.0)
-    optimizer.step()
-    
-    return loss.item()
 
 # --- EBM ONLINE UPDATE ---
 def update_ebm_online(ebm, buffer, optimizer, num_steps=500, batch_size=128):
@@ -529,8 +397,12 @@ def evaluate_policy(env, actor, num_episodes=5):
 # --- TRAIN SINGLE AGENT ---
 def train_agent(agent_type, env, state_buffer):
     """
-    Train policy for a single agent type
-    LAMBDA Algorithm 2 with reward model
+    Train policy for a single agent type.
+    LAMBDA Algorithm 2 with reward model.
+    
+    CRITICAL: Actor update uses model-based pathwise gradient.
+    Gradients flow: V(s') -> s' (from world model) -> a (from actor) -> actor params.
+    This is the entire point of MBRL with differentiable world models.
     """
     print(f"\n{'='*60}")
     print(f"Training Agent: {agent_type}")
@@ -544,9 +416,11 @@ def train_agent(agent_type, env, state_buffer):
     agent = Agent(agent_type, CONFIG["ENV_NAME"], state_dim, action_dim, device)
     
     # Initialize trainable networks
+    # FIX: Use V(s) Value Network instead of Q(s,a) Critic
+    # V(s) is standard for Dreamer/LAMBDA-style MBRL
     actor = Actor(state_dim, action_dim, hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
-    critic = Critic(state_dim, action_dim, hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
-    critic_target = Critic(state_dim, action_dim, hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
+    critic = ValueNetwork(state_dim, hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
+    critic_target = ValueNetwork(state_dim, hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
     critic_target.load_state_dict(critic.state_dict())
     
     # Initialize reward model 
@@ -567,18 +441,13 @@ def train_agent(agent_type, env, state_buffer):
     eval_rewards = []
     eval_steps = []
     episode_count = 0
-    
-    # Loss tracking
-    track_reward_loss = []
-    track_critic_loss = []
-    track_actor_loss = []
+    total_steps = 0
     
     # Training loop
-    total_steps = 0
     state, _ = env.reset()
     
     while total_steps < CONFIG["TOTAL_STEPS"]:
-        # Algorithm 2, Lines 12-17: Real environment interaction
+        # === 1. Real environment interaction ===
         state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
         with torch.no_grad():
             action = actor.sample(state_tensor).cpu().numpy()[0]
@@ -587,9 +456,8 @@ def train_agent(agent_type, env, state_buffer):
         next_state, reward, cost, terminated, truncated, info = env.step(action)
         done = terminated or truncated
         
-       # Add to buffer (Line 17)
+        # Add to buffer
         state_buffer.add_transition(state, action, reward, next_state)
-        
         total_steps += 1
         
         if done:
@@ -598,113 +466,114 @@ def train_agent(agent_type, env, state_buffer):
             
             # Online EBM update every 5 episodes
             if ebm_opt is not None and episode_count % 5 == 0 and state_buffer.size >= 500:
-                print(f"  [Episode {episode_count}] Updating EBM on {state_buffer.size} real transitions...")
-                
-                # Log weight norm BEFORE update
-                norm_before = sum(p.norm().item() for p in agent.ebm.parameters())
-                
                 metrics = update_ebm_online(agent.ebm, state_buffer, ebm_opt, num_steps=500)
-                
-                # Log weight norm AFTER update
-                norm_after = sum(p.norm().item() for p in agent.ebm.parameters())
-                delta = norm_after - norm_before
-                
-                print(f"    Energy gap: {metrics['E_gap']:.4f} (Pos={metrics['E_pos']:.4f}, Neg={metrics['E_neg']:.4f})")
-                print(f"    EBM Weight Delta: {delta:.6f} (Norm: {norm_after:.4f})")
-                
-                if abs(delta) < 1e-6:
-                    print("    WARNING: EBM weights did not change! Check optimizer.")
+                if episode_count % 20 == 0:
+                    print(f"  [EBM Online] Gap: {metrics['E_gap']:.4f} Loss: {metrics['loss']:.4f}")
             
             state, _ = env.reset()
         else:
             state = next_state
         
-        # Algorithm 2, Lines 3-11: Update on imagined data
+        # === 2. Imagined Update (inline — preserves full gradient chain) ===
         if state_buffer.size >= CONFIG["BATCH_SIZE"] and total_steps % 10 == 0:
-            # Train reward model on real data (Line 113)
-            reward_loss = update_reward_model(reward_model, state_buffer, reward_opt)
-            track_reward_loss.append(reward_loss)
+            # Reward Model Update on real data
+            batch = state_buffer.sample_for_reward_training(CONFIG["BATCH_SIZE"])
+            if batch:
+                pred_r = reward_model(batch['states'], batch['actions'])
+                loss_r = F.mse_loss(pred_r, batch['rewards'])
+                reward_opt.zero_grad(); loss_r.backward(); reward_opt.step()
             
-            # Sample initial states (70% recent, 30% diverse)
+            # Sample initial states for imagination
             n_recent = int(CONFIG["BATCH_SIZE"] * 0.7)
             n_diverse = CONFIG["BATCH_SIZE"] - n_recent
             recent_states = state_buffer.sample_recent_states(n_recent)
             diverse_states = state_buffer.sample_diverse_states(n_diverse)
             initial_states = torch.cat([recent_states, diverse_states], dim=0)
             
-            # Generate imagined rollouts WITH predicted rewards (Line 149)
-            states, actions, rewards, next_states, dones = generate_imagined_rollout(
-                agent, actor, reward_model, initial_states, CONFIG["HORIZON"], device
-            )
+            # --- Imagined Rollout (inline, with entropy bonus) ---
+            curr = initial_states
+            states_list, actions_list, rewards_list, next_states_list = [], [], [], []
+            dones = torch.zeros(CONFIG["BATCH_SIZE"], CONFIG["HORIZON"], 1).to(device)
             
-            # Log Energy of Imagined States (Verify if sampling climbs energy surface)
-            if agent.ebm is not None and total_steps % 100 == 0:
-                with torch.no_grad():
-                    # Check energy of the LAST state in rollout
-                    last_states = states[:, -1, :] # (B, D)
-                    # We need "previous" state/action for energy, but here we just check 
-                    # compatibility of (s_{H-1}, a_{H-1}, s_H). 
-                    # Let's just approximate by checking avg energy of transitions in rollout
-                    # Flatten: (B*H, D)
-                    s_flat = states[:, :-1, :].reshape(-1, state_dim)
-                    a_flat = actions[:, :-1, :].reshape(-1, action_dim)
-                    ns_flat = states[:, 1:, :].reshape(-1, state_dim)
-                    
-                    if s_flat.shape[0] > 0:
-                        energies = agent.ebm(s_flat, a_flat, ns_flat)
-                        print(f"    [Img Rollout] Avg Energy: {energies.mean().item():.4f} +/- {energies.std().item():.4f}")
-            
-            # Compute values with target critic
-            # FIX: Use next_states for bootstrapping V(s'), NOT current states!
-            batch_size, horizon, state_dim = next_states.shape
-            
-            # Use optimal actions for next state (target policy)
-            # We don't have next_actions, so we sample them using the ACTOR (target policy approx)
-            # or just use Q(s', a')? 
-            # Standard Actor-Critic: V(s') = Q(s', \pi(s'))
-            
-            # Flatten next states
-            next_states_flat = next_states.reshape(-1, state_dim)
-            
-            with torch.no_grad():
-                # Sample next actions from current actor (or target actor if we had one)
-                next_actions_flat = actor.sample(next_states_flat)
+            for t in range(CONFIG["HORIZON"]):
+                # Differentiable action sampling (rsample via reparameterization trick)
+                a = actor.sample(curr)
                 
-                # Compute Q(s', a')
-                next_values = critic_target(next_states_flat, next_actions_flat)
-                next_values = next_values.reshape(batch_size, horizon)
+                # Entropy bonus for exploration (MaxEnt RL)
+                mu, log_std = actor(curr)
+                std = torch.exp(torch.clamp(log_std, min=-20, max=2))
+                dist = torch.distributions.Normal(mu, std)
+                entropy = dist.entropy().sum(dim=-1, keepdim=True)  # (B, 1)
+                
+                # Predict reward and next state through differentiable world model
+                r_pred = reward_model(curr, a)
+                ns_pred = agent.predict_next_state(curr, a)
+                ns_pred = torch.clamp(ns_pred, -10.0, 10.0)
+                
+                states_list.append(curr)
+                actions_list.append(a)
+                rewards_list.append(r_pred + CONFIG["ENTROPY_COEFF"] * entropy)  # Reward augmentation
+                next_states_list.append(ns_pred)
+                curr = ns_pred
             
-            # Compute lambda values from PREDICTED rewards (Line 102-106)
-            lambda_values = compute_lambda_values(
-                next_values, rewards.squeeze(-1), dones.squeeze(-1),
-                CONFIG["DISCOUNT"], CONFIG["LAMBDA"]
+            states_seq = torch.stack(states_list, dim=1)       # (B, H, D)
+            actions_seq = torch.stack(actions_list, dim=1)     # (B, H, A)
+            rewards_seq = torch.stack(rewards_list, dim=1)     # (B, H, 1)
+            next_states_seq = torch.stack(next_states_list, dim=1)  # (B, H, D)
+            
+            # --- CRITIC UPDATE: V(s) trained on TD-λ targets ---
+            flat_next_states = next_states_seq.reshape(-1, state_dim)
+            with torch.no_grad():
+                flat_next_values = critic_target(flat_next_states)
+                next_values = flat_next_values.reshape(CONFIG["BATCH_SIZE"], CONFIG["HORIZON"], 1)
+            
+            # Compute Lambda Returns (bootstrapped from V)
+            lambda_targets = compute_lambda_values(
+                next_values.squeeze(-1),
+                rewards_seq.squeeze(-1),
+                dones.squeeze(-1),
+                CONFIG["DISCOUNT"],
+                CONFIG["LAMBDA"]
             )
+            lambda_targets = lambda_targets.unsqueeze(-1)  # (B, H, 1)
             
-            # Update critic (Line 118-120)
-            critic_loss = update_critic(critic, critic_target, states, actions, lambda_values, critic_opt)
-            track_critic_loss.append(critic_loss)
+            # Critic loss: V(s) vs λ-targets
+            flat_curr_states = states_seq.reshape(-1, state_dim).detach()
+            v_values = critic(flat_curr_states).reshape(CONFIG["BATCH_SIZE"], CONFIG["HORIZON"], 1)
             
-            # Update actor (Line 106) - reuse actions from trajectory
-            actor_loss = update_actor(actor, critic, states, actions, actor_opt)
-            track_actor_loss.append(actor_loss)
+            critic_loss = F.mse_loss(v_values, lambda_targets.detach())
+            critic_opt.zero_grad()
+            critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
+            critic_opt.step()
+            
+            # --- ACTOR UPDATE: Model-Based Policy Gradient ---
+            # CRITICAL: Gradient flows through V(s') -> s' -> (world model) -> a -> actor
+            # Freeze critic weights but keep input-dependent gradients alive
+            flat_next_states_grad = next_states_seq.reshape(-1, state_dim)  # Has grad from model
+            for p in critic.parameters(): p.requires_grad = False
+            v_next_pred = critic(flat_next_states_grad).reshape(CONFIG["BATCH_SIZE"], CONFIG["HORIZON"], 1)
+            for p in critic.parameters(): p.requires_grad = True
+            
+            # Actor Objective: maximize r + γ * V(s')
+            actor_objective = rewards_seq + CONFIG["DISCOUNT"] * v_next_pred
+            actor_loss = -actor_objective.mean()
+            
+            actor_opt.zero_grad()
+            actor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
+            actor_opt.step()
             
             # Soft update of target critic
-            for param, target_param in zip(critic.parameters(), critic_target.parameters()):
-                target_param.data.copy_(0.005 * param.data + 0.995 * target_param.data)
-                
-            # Log Policy/Reward stats periodically
+            for p, tp in zip(critic.parameters(), critic_target.parameters()):
+                tp.data.copy_(0.005 * p.data + 0.995 * tp.data)
+            
+            # Log stats periodically
             if total_steps % 1000 == 0:
-                avg_r_loss = np.mean(track_reward_loss[-100:]) if track_reward_loss else 0
-                avg_c_loss = np.mean(track_critic_loss[-100:]) if track_critic_loss else 0
-                avg_a_loss = np.mean(track_actor_loss[-100:]) if track_actor_loss else 0
-                
-                # Check reward stats in buffer
                 r_mean = state_buffer.rewards[:state_buffer.size].mean()
                 r_max = state_buffer.rewards[:state_buffer.size].max()
-                r_min = state_buffer.rewards[:state_buffer.size].min()
-                
-                print(f"    [Step {total_steps}] Losses -> Reward: {avg_r_loss:.6f} | Critic: {avg_c_loss:.6f} | Actor: {avg_a_loss:.6f}")
-                print(f"    [Buffer Stats] Reward Mean: {r_mean:.6f} | Max: {r_max:.6f} | Min: {r_min:.6f}")
+                print(f"    [Step {total_steps}] Critic: {critic_loss.item():.6f} | Actor: {actor_loss.item():.6f}")
+                print(f"    [Buffer] Reward Mean: {r_mean:.6f} | Max: {r_max:.6f}")
         
         # Evaluation
         if total_steps % CONFIG["EVAL_INTERVAL"] == 0:
