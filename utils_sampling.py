@@ -15,53 +15,62 @@ DEFAULT_CONFIG = {
 # =============================================================================
 # ENERGY GRADIENT COMPUTATION
 # =============================================================================
-def get_energy_gradient(model, state, action, next_state):
+def get_energy_gradient(model, state, action, next_state, differentiable=False):
     """
     Compute ∂E(s,a,s')/∂s' for any dimensionality.
     
     Handles both:
     - next_state: (B, D) → returns (B, D)
     - next_state: (B, P, D) → returns (B, P, D) for SVGD particles
+    
+    Args:
+        differentiable: If True, keeps the computation graph connected
+            across Langevin steps (no detach). Required for true E2E
+            gradient flow through the sampling chain.
+            If False (default), detaches at each step for memory efficiency.
     """
     original_shape = next_state.shape
     is_particles = len(original_shape) == 3
     
     if is_particles:
-        # SVGD case: (B, P, D)
+        # SVGD case: (B, P, D) — already differentiable (no detach)
         B, P, D = original_shape
-        # Flatten to (B*P, D)
         next_state_flat = next_state.reshape(B * P, D).requires_grad_(True)
-        # Repeat state/action P times
         state_exp = state.unsqueeze(1).expand(B, P, -1).reshape(B * P, -1)
         action_exp = action.unsqueeze(1).expand(B, P, -1).reshape(B * P, -1)
         
-        # Compute energies: (B*P,)
         energies = model(state_exp, action_exp, next_state_flat)
-        
-        # Gradient with create_graph=True for planning gradients
         grad = torch.autograd.grad(
             outputs=energies, inputs=next_state_flat,
             grad_outputs=torch.ones_like(energies),
-            create_graph=True  # Enable for planning gradients
+            create_graph=True
         )[0]
-        
-        # Reshape back to (B, P, D)
         return grad.reshape(B, P, D)
     else:
         # Langevin case: (B, D)
-        # Enable grad to ensure we can take gradients w.r.t input even in no_grad mode
-        with torch.enable_grad():
-            next_state = next_state.detach().requires_grad_(True)
-            energies = model(state, action, next_state)
-            
-            # Gradient with create_graph=True for planning gradients
+        if differentiable:
+            # DIFFERENTIABLE MODE: keep graph connected across steps
+            # Do NOT detach — gradients flow through entire Langevin chain
+            ns = next_state
+            if not ns.requires_grad:
+                ns = ns.detach().requires_grad_(True)  # only for initial leaf
+            energies = model(state, action, ns)
             grad = torch.autograd.grad(
-                outputs=energies, inputs=next_state,
-                grad_outputs=torch.ones_like(energies),
-                create_graph=True  # Enable for planning gradients
+                outputs=energies.sum(), inputs=ns,
+                create_graph=True, retain_graph=True
             )[0]
-        
-        return grad
+            return grad
+        else:
+            # DETACHED MODE (default): memory-efficient, no cross-step gradients
+            with torch.enable_grad():
+                next_state = next_state.detach().requires_grad_(True)
+                energies = model(state, action, next_state)
+                grad = torch.autograd.grad(
+                    outputs=energies, inputs=next_state,
+                    grad_outputs=torch.ones_like(energies),
+                    create_graph=True
+                )[0]
+            return grad
 
 # =============================================================================
 # 1. LANGEVIN DYNAMICS
@@ -82,7 +91,7 @@ def predict_next_state_langevin(model, state, action, init_state=None, config=No
     
     return curr_state
 
-def predict_next_state_langevin_adaptive(model, state, action, init_state=None, use_ascent=False, config=None):
+def predict_next_state_langevin_adaptive(model, state, action, init_state=None, use_ascent=False, config=None, differentiable=False):
     """
     Adaptive Langevin dynamics for BilinearEBM and standard EBM.
     
@@ -94,6 +103,10 @@ def predict_next_state_langevin_adaptive(model, state, action, init_state=None, 
         use_ascent: If True, use gradient ASCENT (for BilinearEBM: higher energy = better)
                     If False, use gradient DESCENT (for standard EBM: lower energy = better)
         config: Optional config dict
+        differentiable: If True, keeps gradient graph connected across ALL
+            Langevin steps, enabling true E2E backpropagation through the
+            sampling chain. More memory-intensive but required for proper
+            model-based policy gradients. Default False for compatibility.
     
     Returns:
         predicted_state: (B, state_dim)
@@ -108,16 +121,13 @@ def predict_next_state_langevin_adaptive(model, state, action, init_state=None, 
     
     for i in range(cfg["LANGEVIN_STEPS"]):
         noise = torch.randn_like(curr_state) * cfg["LANGEVIN_NOISE_SCALE"]
-        grad_energy = get_energy_gradient(model, state, action, curr_state)
+        grad_energy = get_energy_gradient(model, state, action, curr_state, differentiable=differentiable)
         
         if use_ascent:
-            # BilinearEBM: higher energy = more compatible → gradient ASCENT
             curr_state = curr_state + cfg["LANGEVIN_STEP_SIZE"] * grad_energy + noise
         else:
-            # Standard EBM: lower energy = higher probability → gradient DESCENT
             curr_state = curr_state - cfg["LANGEVIN_STEP_SIZE"] * grad_energy + noise
             
-        # CLIP state to reasonable bounds to prevent divergence
         curr_state = torch.clamp(curr_state, -10.0, 10.0)
     
     return curr_state
