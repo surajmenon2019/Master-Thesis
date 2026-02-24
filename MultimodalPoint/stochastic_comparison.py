@@ -62,7 +62,8 @@ CONFIG = {
     "SLIP_PROB": 0.3,
     "DEFLECTION_ANGLE": 90.0,
     "N_OBSTACLES": 3,
-    "SEED": 42,
+    # Multiple seeds for statistical validity
+    "SEEDS": [42, 123, 7],
 
     # Experiment matrix
     "CONFIGS": ["MDN", "EBM E2E", "EBM Warm Start"],
@@ -78,6 +79,11 @@ CONFIG = {
     "LR_REWARD": 1e-3,
     "ENTROPY_COEFF": 0.01,
     "UPDATE_FREQ": 10,
+
+    # Gradient clipping — applied AFTER logging raw norm, preserving full
+    # computation graph (E2E differentiability is unaffected; only caps magnitude).
+    # Set to None to disable.
+    "GRAD_CLIP_NORM": 1.0,
 
     # Sampling
     "LANGEVIN_STEPS_COLD": 30,
@@ -116,6 +122,28 @@ def compute_lambda_values(next_values, rewards, dones, discount, lambda_):
         )
         lambda_values[:, t] = v_lambda
     return lambda_values
+
+
+def squashed_gaussian_entropy(actor, state, squashed_action, eps=1e-6):
+        """
+        Differential entropy proxy for tanh-squashed Gaussian policy.
+
+        Uses change-of-variables:
+            log pi(a|s) = log N(u; mu, sigma) - sum log(1 - tanh(u)^2)
+            where a = tanh(u), u = atanh(a)
+        and returns -log pi(a|s).
+        """
+        mu, log_std = actor.forward(state)
+        std = torch.exp(log_std)
+        dist = torch.distributions.Normal(mu, std)
+
+        a = squashed_action.clamp(-1.0 + eps, 1.0 - eps)
+        pre_tanh = 0.5 * (torch.log1p(a) - torch.log1p(-a))
+
+        log_prob_u = dist.log_prob(pre_tanh)
+        log_det_jac = torch.log(1.0 - a.pow(2) + eps)
+        log_prob_a = (log_prob_u - log_det_jac).sum(dim=-1, keepdim=True)
+        return -log_prob_a
 
 
 # =============================================================================
@@ -361,7 +389,8 @@ def evaluate_policy(env_adapter, actor, num_episodes, device):
         while not done and steps < 200:
             st = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
             with torch.no_grad():
-                action = actor.sample(st)
+                mu, _ = actor.forward(st)
+                action = torch.tanh(mu)
                 action_np = action.cpu().numpy()[0]
             next_state, reward, done, info = env_adapter.step(action_np)
             episode_reward += reward
@@ -434,6 +463,13 @@ def train_single_run(config_name, horizon, env_adapter, warmup_buffer, run_seed)
     episode_count = 0
     state = env_adapter.reset()
 
+    obs_low = torch.tensor(
+        env_adapter.env.observation_space.low, dtype=torch.float32, device=device
+    )
+    obs_high = torch.tensor(
+        env_adapter.env.observation_space.high, dtype=torch.float32, device=device
+    )
+
     while total_steps < CONFIG["TOTAL_STEPS"]:
         # 1. Real environment interaction
         st = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
@@ -478,17 +514,20 @@ def train_single_run(config_name, horizon, env_adapter, warmup_buffer, run_seed)
             states_list, rewards_list, next_states_list = [], [], []
 
             for t in range(horizon):
-                # Sample continuous action from actor
-                a_cont = actor.sample(curr)  # (B, action_dim)
+                # Clip actor output to env action space [-1, 1]
+                # (env clips internally, but world model / reward model must
+                #  also see in-distribution actions, so clip before passing in)
+                a_cont = actor.sample(curr).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
 
-                # Entropy for continuous policy
-                mu, log_std = actor.forward(curr)
-                std = torch.exp(log_std)
-                dist = torch.distributions.Normal(mu, std)
-                entropy = dist.entropy().sum(dim=-1, keepdim=True)
+                # Entropy bonus computed in the same squashed-action space
+                # as the policy output to avoid objective mismatch.
+                entropy = squashed_gaussian_entropy(actor, curr, a_cont)
 
-                r_pred = reward_model(curr, a_cont)
+                # Keep reward model in realistic environment scale.
+                r_pred = reward_model(curr, a_cont).clamp(-2.0, 12.0)
+
                 ns_pred = agent.predict_next_state(curr, a_cont)
+                ns_pred = torch.max(torch.min(ns_pred, obs_high), obs_low)
 
                 states_list.append(curr)
                 rewards_list.append(r_pred + CONFIG["ENTROPY_COEFF"] * entropy)
@@ -499,7 +538,6 @@ def train_single_run(config_name, horizon, env_adapter, warmup_buffer, run_seed)
             rewards_seq = torch.stack(rewards_list, dim=1)
             next_states_seq = torch.stack(next_states_list, dim=1)
             dones = torch.zeros(CONFIG["BATCH_SIZE"], horizon, 1, device=device)
-            dones[:, -1, :] = 1.0
 
             # Critic update (TD-lambda)
             flat_next_states = next_states_seq.reshape(-1, state_dim)
@@ -537,7 +575,11 @@ def train_single_run(config_name, horizon, env_adapter, warmup_buffer, run_seed)
             actor_opt.zero_grad()
             actor_loss.backward()
 
-            # Track gradient norms
+            # Record raw gradient norm BEFORE clipping (diagnostic signal).
+            # Clipping is applied after recording so the logged norm reflects
+            # the true gradient magnitude the world model produced — not the
+            # clipped version. The E2E computation graph is fully intact;
+            # clipping only caps gradient magnitude to prevent explosion.
             total_norm = 0.0
             for p in actor.parameters():
                 if p.grad is not None:
@@ -545,7 +587,10 @@ def train_single_run(config_name, horizon, env_adapter, warmup_buffer, run_seed)
             total_norm = total_norm ** 0.5
             recent_grad_norms.append(total_norm)
 
-            torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=10.0)
+            if CONFIG["GRAD_CLIP_NORM"] is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    actor.parameters(), max_norm=CONFIG["GRAD_CLIP_NORM"]
+                )
             actor_opt.step()
 
             # Soft target update
@@ -597,6 +642,7 @@ def plot_results(all_results, save_dir):
     horizons = CONFIG["HORIZONS"]
     configs = CONFIG["CONFIGS"]
     n_h = len(horizons)
+    n_seeds = len(CONFIG["SEEDS"])
 
     colors = {
         "MDN": "#00CC96",            # Green (explicit)
@@ -611,33 +657,39 @@ def plot_results(all_results, save_dir):
 
     smooth_window = 5
 
-    # FIGURE 1: Policy Convergence
+    # FIGURE 1: Policy Convergence (mean ± std across seeds)
     fig1, axes1 = plt.subplots(1, n_h, figsize=(6 * n_h, 5.5), sharey=True)
     if n_h == 1:
         axes1 = [axes1]
     fig1.suptitle(
         f"Continuous Multimodal Env (slip={CONFIG['SLIP_PROB']}): "
-        f"Explicit vs EBM Policy Convergence",
-        fontsize=14, fontweight='bold', y=1.02
+        f"Explicit vs EBM Policy Convergence"
+        f" (mean \u00b1 std, {n_seeds} seeds, clip={CONFIG['GRAD_CLIP_NORM']})",
+        fontsize=13, fontweight='bold', y=1.02
     )
 
     for i, H in enumerate(horizons):
         ax = axes1[i]
         for config_name in configs:
-            key = f"{config_name}_H{H}"
-            if key not in all_results:
+            agg = aggregate_seeds(all_results, config_name, H)
+            if agg is None:
                 continue
-            r = all_results[key]
-            steps = r['eval_steps']
-            rewards = r['eval_rewards']
+            steps = agg['steps']
+            mean_r = agg['reward_mean']
+            std_r = agg['reward_std']
 
-            ax.scatter(steps, rewards, color=colors[config_name],
-                       alpha=0.10, s=8, zorder=1)
-            smoothed, offset = smooth_curve(rewards, smooth_window)
+            smoothed, offset = smooth_curve(mean_r, smooth_window)
             smooth_steps = steps[offset:]
-            ax.plot(smooth_steps, smoothed, color=colors[config_name],
+            smooth_std = std_r[offset:]
+
+            c = colors[config_name]
+            ax.plot(smooth_steps, smoothed, color=c,
                     linestyle=linestyles[config_name], linewidth=2.5,
                     label=config_name, zorder=2)
+            ax.fill_between(smooth_steps,
+                            smoothed - smooth_std,
+                            smoothed + smooth_std,
+                            color=c, alpha=0.15, zorder=1)
 
         ax.set_title(f"Horizon = {H}", fontsize=13, fontweight='bold')
         ax.set_xlabel("Training Steps", fontsize=11)
@@ -653,40 +705,44 @@ def plot_results(all_results, save_dir):
     print(f"Saved: {path1}")
     plt.close(fig1)
 
-    # FIGURE 2: Gradient Norms
+    # FIGURE 2: Gradient Norms (mean ± std, pre-clip, log scale)
     fig2, axes2 = plt.subplots(1, n_h, figsize=(6 * n_h, 5.5), sharey=False)
     if n_h == 1:
         axes2 = [axes2]
     fig2.suptitle(
         f"Continuous Multimodal Env (slip={CONFIG['SLIP_PROB']}): "
-        f"Actor Gradient Norms",
-        fontsize=14, fontweight='bold', y=1.02
+        f"Actor Gradient Norms (raw, pre-clip)"
+        f" (mean \u00b1 std, {n_seeds} seeds)",
+        fontsize=13, fontweight='bold', y=1.02
     )
 
     for i, H in enumerate(horizons):
         ax = axes2[i]
         for config_name in configs:
-            key = f"{config_name}_H{H}"
-            if key not in all_results:
+            agg = aggregate_seeds(all_results, config_name, H)
+            if agg is None or len(agg['gnorm_mean']) == 0:
                 continue
-            r = all_results[key]
-            gn_steps = r['grad_norm_steps']
-            gn = r['grad_norms']
-            if len(gn) == 0:
-                continue
+            steps = agg['steps']
+            mean_gn = agg['gnorm_mean']
+            std_gn = agg['gnorm_std']
 
-            ax.scatter(gn_steps, gn, color=colors[config_name],
-                       alpha=0.10, s=8, zorder=1)
-            smoothed, offset = smooth_curve(gn, smooth_window)
-            smooth_steps = gn_steps[offset:]
-            ax.plot(smooth_steps, smoothed, color=colors[config_name],
+            smoothed, offset = smooth_curve(mean_gn, smooth_window)
+            smooth_steps = steps[offset:]
+            smooth_std = std_gn[offset:]
+
+            c = colors[config_name]
+            ax.plot(smooth_steps, smoothed, color=c,
                     linestyle=linestyles[config_name], linewidth=2.5,
                     label=config_name, zorder=2)
+            ax.fill_between(smooth_steps,
+                            np.maximum(smoothed - smooth_std, 1e-6),
+                            smoothed + smooth_std,
+                            color=c, alpha=0.15, zorder=1)
 
         ax.set_title(f"Horizon = {H}", fontsize=13, fontweight='bold')
         ax.set_xlabel("Training Steps", fontsize=11)
         if i == 0:
-            ax.set_ylabel("Gradient Norm", fontsize=11)
+            ax.set_ylabel("Gradient Norm (pre-clip)", fontsize=11)
         ax.set_yscale("log")
         ax.grid(True, alpha=0.25, linestyle='--')
         ax.legend(fontsize=10, loc='upper right', framealpha=0.9)
@@ -703,22 +759,64 @@ def plot_results(all_results, save_dir):
 # MAIN
 # =============================================================================
 
+def aggregate_seeds(all_results, config_name, horizon):
+    """
+    Collect per-seed results for a (config_name, horizon) pair and return
+    mean ± std arrays interpolated onto a common step grid.
+    """
+    seed_rewards, seed_gnorms = [], []
+    ref_steps = None
+
+    for seed in CONFIG["SEEDS"]:
+        key = f"{config_name}_H{horizon}_seed{seed}"
+        if key not in all_results:
+            continue
+        r = all_results[key]
+        if len(r['eval_rewards']) == 0:
+            continue
+        steps = r['eval_steps']
+        if ref_steps is None:
+            ref_steps = steps
+        seed_rewards.append(np.interp(ref_steps, steps, r['eval_rewards']))
+        if len(r['grad_norms']) > 0:
+            gn_steps = r['grad_norm_steps']
+            seed_gnorms.append(np.interp(ref_steps, gn_steps, r['grad_norms']))
+
+    if ref_steps is None or len(seed_rewards) == 0:
+        return None
+
+    rw = np.array(seed_rewards)
+    gn = np.array(seed_gnorms) if seed_gnorms else None
+    return {
+        'steps': ref_steps,
+        'reward_mean': rw.mean(axis=0),
+        'reward_std': rw.std(axis=0),
+        'gnorm_mean': gn.mean(axis=0) if gn is not None else np.array([]),
+        'gnorm_std': gn.std(axis=0) if gn is not None else np.array([]),
+    }
+
+
 def main():
     device = CONFIG["DEVICE"]
     save_dir = os.path.join(SCRIPT_DIR, CONFIG["SAVE_DIR"])
     os.makedirs(save_dir, exist_ok=True)
 
+    n_seeds = len(CONFIG["SEEDS"])
+    total_runs = len(CONFIG["CONFIGS"]) * len(CONFIG["HORIZONS"]) * n_seeds
+
     print(f"\n{'='*70}")
     print(f"  CONTINUOUS MULTIMODAL STOCHASTIC EXPERIMENT")
     print(f"  Environment: {CONFIG['ENV_NAME']}")
     print(f"    slip_prob={CONFIG['SLIP_PROB']}, "
-          f"deflection={CONFIG['DEFLECTION_ANGLE']}°, "
+          f"deflection={CONFIG['DEFLECTION_ANGLE']}\u00b0, "
           f"obstacles={CONFIG['N_OBSTACLES']}")
-    print(f"  Configs: {CONFIG['CONFIGS']}")
-    print(f"  Horizons: {CONFIG['HORIZONS']}")
-    print(f"  Steps/run: {CONFIG['TOTAL_STEPS']}")
-    print(f"  Total runs: {len(CONFIG['CONFIGS']) * len(CONFIG['HORIZONS'])}")
-    print(f"  Device: {device}")
+    print(f"  Configs:     {CONFIG['CONFIGS']}")
+    print(f"  Horizons:    {CONFIG['HORIZONS']}")
+    print(f"  Seeds:       {CONFIG['SEEDS']}")
+    print(f"  Steps/run:   {CONFIG['TOTAL_STEPS']}")
+    print(f"  Total runs:  {total_runs}")
+    print(f"  Grad clip:   {CONFIG['GRAD_CLIP_NORM']}")
+    print(f"  Device:      {device}")
     print(f"{'='*70}\n")
 
     # Create environment adapter
@@ -728,9 +826,9 @@ def main():
         n_obstacles=CONFIG["N_OBSTACLES"],
     )
 
-    # Warmup: collect initial transitions with random policy
+    # Warmup: collect initial transitions with random policy (first seed)
     print("Collecting warmup data...")
-    np.random.seed(CONFIG["SEED"])
+    np.random.seed(CONFIG["SEEDS"][0])
     warmup_buffer = TrajectoryBuffer(env_adapter.state_dim, env_adapter.action_dim)
     state = env_adapter.reset()
     for i in range(CONFIG["WARMUP_STEPS"]):
@@ -742,37 +840,40 @@ def main():
             state = env_adapter.reset()
         else:
             state = ns
+    warmup_buffer.finish_trajectory()
     print(f"  Warmup done: {warmup_buffer.size} transitions collected\n")
 
-    # Run experiment matrix
+    # Run all (config, horizon, seed) combinations
     all_results = {}
     run_idx = 0
-    total_runs = len(CONFIG["CONFIGS"]) * len(CONFIG["HORIZONS"])
 
     for config_name in CONFIG["CONFIGS"]:
         for horizon in CONFIG["HORIZONS"]:
-            run_idx += 1
-            print(f"\n{'='*50}")
-            print(f"  Run {run_idx}/{total_runs}: {config_name}, H={horizon}")
-            print(f"{'='*50}")
+            for seed in CONFIG["SEEDS"]:
+                run_idx += 1
+                print(f"\n{'='*55}")
+                print(f"  Run {run_idx}/{total_runs}: "
+                      f"{config_name}, H={horizon}, seed={seed}")
+                print(f"{'='*55}")
 
-            t0 = time.time()
-            result = train_single_run(
-                config_name, horizon, env_adapter,
-                warmup_buffer, CONFIG["SEED"]
-            )
-            elapsed = time.time() - t0
+                t0 = time.time()
+                result = train_single_run(
+                    config_name, horizon, env_adapter,
+                    warmup_buffer, seed
+                )
+                elapsed = time.time() - t0
 
-            key = f"{config_name}_H{horizon}"
-            all_results[key] = result
+                # Key includes seed so runs don't overwrite each other
+                key = f"{config_name}_H{horizon}_seed{seed}"
+                all_results[key] = result
 
-            final_reward = (result['eval_rewards'][-1]
-                            if len(result['eval_rewards']) > 0 else 0)
-            print(f"  Done in {elapsed:.1f}s. Final eval: {final_reward:.3f}")
+                final_reward = (result['eval_rewards'][-1]
+                                if len(result['eval_rewards']) > 0 else 0)
+                print(f"  Done in {elapsed:.1f}s. Final eval: {final_reward:.3f}")
 
-            # Save intermediate
-            np.save(os.path.join(save_dir, "all_results.npy"),
-                    all_results, allow_pickle=True)
+                # Save incrementally after every run
+                np.save(os.path.join(save_dir, "all_results.npy"),
+                        all_results, allow_pickle=True)
 
     # Generate plots
     print("\n\nGenerating figures...")
