@@ -716,25 +716,27 @@ def train_single_run(config_name, horizon, env_adapter, warmup_buffer, run_seed)
 
             actor_objective = rewards_seq + CONFIG["DISCOUNT"] * v_next_pred
 
-            # Advantage normalisation (all configs).
-            #
-            # Both MDN and EBM suffer from unbounded gradient growth as the
-            # reward model / critic sharpen during training:
-            #   MDN:  clean forward pass amplifies ∂r/∂s'  (7 → 60)
-            #   EBM:  differentiable Langevin chain is a PRODUCT of K
-            #         Jacobians (I + η·H_E).  When any eigenvalue of the
-            #         energy Hessian H_E exceeds 1/η, this product explodes
-            #         exponentially  (12 → 4,000,000).
-            #
-            # Baseline subtraction centres the objective; std-division
-            # keeps gradient magnitude bounded regardless of value scale.
+            # Advantage baseline subtraction (all configs) — reduces
+            # variance without changing gradient direction.
             with torch.no_grad():
                 v_baseline = critic_target(
                     states_seq.reshape(-1, state_dim)
                 ).reshape(CONFIG["BATCH_SIZE"], horizon, 1)
             advantage = actor_objective - v_baseline
-            adv_std = advantage.std().detach().clamp(min=1.0)
-            actor_loss = -(advantage / adv_std).mean()
+
+            # Std-normalisation: only MDN needs this.
+            #   MDN's clean forward pass has unbounded ∂s'/∂a, so the raw
+            #   gradient grows as the reward model sharpens (7 → 60).
+            #   Dividing by adv_std (~20-30) keeps it bounded.
+            #
+            #   EBM uses truncated backprop (single-step Jacobian), which
+            #   already bounds gradients (~1-2).  Dividing by adv_std would
+            #   reduce them to ~0.04 — too weak to learn.
+            if config_name == "MDN":
+                adv_std = advantage.std().detach().clamp(min=1.0)
+                actor_loss = -(advantage / adv_std).mean()
+            else:
+                actor_loss = -advantage.mean()
 
             actor_opt.zero_grad()
             actor_loss.backward()
