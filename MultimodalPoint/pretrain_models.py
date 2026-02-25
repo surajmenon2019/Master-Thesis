@@ -20,7 +20,7 @@ PARENT_DIR = os.path.dirname(SCRIPT_DIR)
 sys.path.insert(0, PARENT_DIR)
 sys.path.insert(0, SCRIPT_DIR)
 
-from models import BilinearEBM, RealNVP, MixtureDensityNetwork, ValueNetwork, RewardModel
+from models import BilinearEBM, RealNVP, MixtureDensityNetwork, ValueNetwork, RewardModel, TransitionRewardModel
 from multimodal_point_env import MultimodalPointEnv
 
 # --- CONFIGURATION ---
@@ -165,7 +165,7 @@ def train_all_models():
                    hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
     mdn = MixtureDensityNetwork(state_dim, action_dim, num_gaussians=5,
                                 hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
-    reward_model = RewardModel(state_dim, action_dim, hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
+    reward_model = TransitionRewardModel(state_dim, action_dim, hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
     value_net = ValueNetwork(state_dim, hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
 
     ebm_opt = optim.Adam(ebm.parameters(), lr=CONFIG["LR_EBM"])
@@ -211,9 +211,9 @@ def train_all_models():
         loss_mdn.backward()
         mdn_opt.step()
 
-        # D. TRAIN REWARD MODEL
-        s_r, a_r, _, r_r = buffer.sample_with_rewards(CONFIG["BATCH_SIZE"])
-        r_pred = reward_model(s_r, a_r)
+        # D. TRAIN REWARD MODEL  r(s, a, s')
+        s_r, a_r, ns_r, r_r = buffer.sample_with_rewards(CONFIG["BATCH_SIZE"])
+        r_pred = reward_model(s_r, a_r, ns_r)
         loss_reward = F.mse_loss(r_pred, r_r)
         reward_opt.zero_grad()
         loss_reward.backward()
@@ -221,7 +221,7 @@ def train_all_models():
 
         # E. TRAIN VALUE NETWORK (on collected states with reward as target)
         with torch.no_grad():
-            v_target = reward_model(s_r, a_r)
+            v_target = reward_model(s_r, a_r, ns_r)
         v_pred = value_net(s_r)
         loss_value = F.mse_loss(v_pred, v_target)
         value_opt.zero_grad()

@@ -276,6 +276,30 @@ class RewardModel(nn.Module):
         x = torch.cat([state, action], dim=1)
         return self.net(x)
 
+
+class TransitionRewardModel(nn.Module):
+    """Reward model conditioned on (s, a, s').
+
+    Unlike RewardModel which predicts r(s,a) = E[r | s, a], this model
+    predicts r(s, a, s') — the reward for a *specific* transition.
+    In stochastic environments where reward depends on the next state
+    (e.g., goal bonus only when the agent reaches the goal), r(s,a) averages
+    over modes and loses critical signal.  r(s,a,s') preserves it.
+    """
+    def __init__(self, state_dim, action_dim, hidden_dim=128):
+        super(TransitionRewardModel, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim + action_dim + state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, state, action, next_state):
+        x = torch.cat([state, action, next_state], dim=1)
+        return self.net(x)
+
 class ValueNetwork(nn.Module):
     def __init__(self, state_dim, hidden_dim=128):
         super(ValueNetwork, self).__init__()

@@ -44,7 +44,7 @@ def _model_path(filename):
 try:
     from models import (
         Actor, BilinearEBM, RealNVP, MixtureDensityNetwork,
-        ValueNetwork, RewardModel, Critic
+        ValueNetwork, RewardModel, TransitionRewardModel, Critic
     )
     from utils_sampling import predict_next_state_langevin_adaptive
     from multimodal_point_env import MultimodalPointEnv, MultimodalPointAdapter
@@ -70,30 +70,38 @@ CONFIG = {
     "HORIZONS": [1, 5],
 
     # Training
-    "TOTAL_STEPS": 15000,
+    "TOTAL_STEPS": 30000,
     "BATCH_SIZE": 256,
     "DISCOUNT": 0.99,
     "LAMBDA": 0.95,
-    "LR_ACTOR": 3e-4,
-    "LR_CRITIC": 1e-3,
+    "LR_ACTOR": 1e-4,
+    "LR_ACTOR_EBM": 5e-5,
+    "LR_CRITIC": 3e-4,
     "LR_REWARD": 1e-3,
-    "ENTROPY_COEFF": 0.01,
+    "ENTROPY_COEFF": 0.003,
+    "ENTROPY_COEFF_EBM": 0.007,
     "UPDATE_FREQ": 10,
 
     # Gradient clipping — applied AFTER logging raw norm, preserving full
     # computation graph (E2E differentiability is unaffected; only caps magnitude).
     # Set to None to disable.
-    "GRAD_CLIP_NORM": 1.0,
+    "GRAD_CLIP_NORM": 0.5,
 
     # Sampling
-    "LANGEVIN_STEPS_COLD": 30,
+    "LANGEVIN_STEPS_COLD": 25,
     "LANGEVIN_STEPS_WARM": 5,
-    "LANGEVIN_STEP_SIZE": 0.05,
-    "LANGEVIN_NOISE_SCALE": 0.01,
+    "LANGEVIN_STEP_SIZE": 0.02,
+    "LANGEVIN_NOISE_SCALE": 0.005,
+
+    # Online EBM finetuning during policy learning can cause world-model drift.
+    # Keep disabled by default; pretraining quality is usually enough here.
+    "ENABLE_ONLINE_EBM_UPDATE": False,
+    "ONLINE_EBM_UPDATE_EVERY_EPISODES": 10,
+    "ONLINE_EBM_UPDATE_STEPS": 20,
 
     # Evaluation
-    "EVAL_INTERVAL": 500,
-    "EVAL_EPISODES": 5,
+    "EVAL_INTERVAL": 1000,
+    "EVAL_EPISODES": 50,
 
     # System
     "DEVICE": "cuda" if torch.cuda.is_available() else "cpu",
@@ -163,6 +171,7 @@ class TrajectoryBuffer:
         self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
         self.ptr = 0
         self.size = 0
+        self.positive_indices = []  # indices of transitions with high reward (goal reached)
         self.recent_trajectories = []
         self.max_recent_trajectories = 20
         self.current_trajectory = {'states': [], 'actions': [], 'rewards': []}
@@ -175,6 +184,13 @@ class TrajectoryBuffer:
         self.actions[self.ptr] = action
         self.rewards[self.ptr] = reward
         self.next_states[self.ptr] = next_state
+        # Track high-reward transitions (goal bonus > 5.0) for priority sampling
+        if reward > 5.0:
+            if self.ptr not in self.positive_indices:
+                self.positive_indices.append(self.ptr)
+        else:
+            if self.ptr in self.positive_indices:
+                self.positive_indices.remove(self.ptr)
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
@@ -191,12 +207,31 @@ class TrajectoryBuffer:
         self.current_trajectory = {'states': [], 'actions': [], 'rewards': []}
 
     def sample_imagination_states(self, batch_size, device):
+        """Sample starting states for imagination.
+
+        Prioritized sampling: 50% from positive (goal-reaching) transitions
+        when available, remainder from recent trajectories / random buffer.
+        This ensures the agent imagines successful trajectories and
+        propagates the sparse +10 goal reward signal.
+        """
         if self.size == 0:
             return torch.randn(batch_size, self.state_dim).to(device)
-        # Mix recent and random
+
         states_list = []
+        num_pos = len(self.positive_indices)
+
+        # 1. POSITIVES (50% of batch when available)
+        if num_pos > 0:
+            n_pos = batch_size // 2
+            idx_pos = np.random.choice(self.positive_indices, size=n_pos, replace=True)
+            states_list.append(self.states[idx_pos])
+            n_remaining = batch_size - n_pos
+        else:
+            n_remaining = batch_size
+
+        # 2. RECENT + RANDOM (remaining 50%)
         if len(self.recent_trajectories) > 0:
-            n_recent = batch_size // 2
+            n_recent = n_remaining // 2
             recent_states = []
             for _ in range(n_recent):
                 traj = self.recent_trajectories[
@@ -205,21 +240,39 @@ class TrajectoryBuffer:
                 s = traj['states'][np.random.randint(0, len(traj['states']))]
                 recent_states.append(s)
             states_list.append(np.array(recent_states))
-            n_remaining = batch_size - n_recent
+            n_rand = n_remaining - n_recent
         else:
-            n_remaining = batch_size
-        idx = np.random.randint(0, self.size, size=n_remaining)
+            n_rand = n_remaining
+
+        idx = np.random.randint(0, self.size, size=n_rand)
         states_list.append(self.states[idx])
         batch_states = np.concatenate(states_list, axis=0)
         return torch.tensor(batch_states, dtype=torch.float32).to(device)
 
     def sample_for_reward_training(self, batch_size, device):
+        """Sample transitions for reward model training.
+
+        When positive (goal-reaching) transitions exist, 50% of the batch
+        is drawn from them.  This prevents the reward model from under-
+        fitting the rare +10 goal bonus that drives the entire task.
+
+        Returns (s, a, s', r) so the TransitionRewardModel can learn r(s,a,s').
+        """
         if self.size == 0:
             return None
-        idx = np.random.randint(0, self.size, size=batch_size)
+        num_pos = len(self.positive_indices)
+        if num_pos > 0:
+            half = batch_size // 2
+            pos_idx = np.random.choice(self.positive_indices, size=half, replace=True)
+            rand_idx = np.random.randint(0, self.size, size=batch_size - half)
+            idx = np.concatenate([pos_idx, rand_idx])
+            np.random.shuffle(idx)
+        else:
+            idx = np.random.randint(0, self.size, size=batch_size)
         return {
             'states': torch.tensor(self.states[idx], dtype=torch.float32).to(device),
             'actions': torch.tensor(self.actions[idx], dtype=torch.float32).to(device),
+            'next_states': torch.tensor(self.next_states[idx], dtype=torch.float32).to(device),
             'rewards': torch.tensor(self.rewards[idx], dtype=torch.float32).to(device)
         }
 
@@ -242,6 +295,7 @@ class TrajectoryBuffer:
         new_buf.next_states[:] = self.next_states[:]
         new_buf.ptr = self.ptr
         new_buf.size = self.size
+        new_buf.positive_indices = list(self.positive_indices)
         new_buf.recent_trajectories = [
             {k: v.copy() for k, v in traj.items()}
             for traj in self.recent_trajectories
@@ -346,8 +400,17 @@ class WorldModelAgent:
             return self.mdn.sample_differentiable(state, action)
 
         elif self.config_name == "EBM E2E":
+            # Initialize from current state + small noise instead of N(0,1).
+            # Rationale: in 15-dim state space, N(0,1) is ~3.9 units from
+            # the origin while valid states live in [-1,1]. With step_size
+            # 0.02 and 25 steps the chain can only move ~0.5 units — not
+            # enough to reach the data manifold from random init. Starting
+            # near the current state (physically: "next state is close to
+            # current state") lets Langevin refine rather than discover.
+            init_e2e = state + 0.1 * torch.randn_like(state)
             return predict_next_state_langevin_adaptive(
                 self.ebm, state, action,
+                init_state=init_e2e,
                 use_ascent=True,
                 config={
                     "LANGEVIN_STEPS": CONFIG["LANGEVIN_STEPS_COLD"],
@@ -378,11 +441,17 @@ class WorldModelAgent:
 # EVALUATION
 # =============================================================================
 
-def evaluate_policy(env_adapter, actor, num_episodes, device):
-    """Run actor in real environment, return mean reward."""
+def evaluate_policy(eval_env, actor, num_episodes, device):
+    """Run actor in a SEPARATE eval environment, return reward stats and success rate.
+
+    Uses its own env instance so that evaluation never corrupts the
+    training environment's internal state (position, heading, obstacles,
+    step counter, RNG).
+    """
     episode_rewards = []
+    success_count = 0
     for _ in range(num_episodes):
-        state = env_adapter.reset()
+        state = eval_env.reset()
         done = False
         episode_reward = 0
         steps = 0
@@ -392,12 +461,14 @@ def evaluate_policy(env_adapter, actor, num_episodes, device):
                 mu, _ = actor.forward(st)
                 action = torch.tanh(mu)
                 action_np = action.cpu().numpy()[0]
-            next_state, reward, done, info = env_adapter.step(action_np)
+            next_state, reward, done, info = eval_env.step(action_np)
             episode_reward += reward
+            if info.get("reached", False):
+                success_count += 1
             state = next_state
             steps += 1
         episode_rewards.append(episode_reward)
-    return np.mean(episode_rewards)
+    return np.mean(episode_rewards), np.std(episode_rewards), success_count / num_episodes
 
 
 # =============================================================================
@@ -433,6 +504,13 @@ def train_single_run(config_name, horizon, env_adapter, warmup_buffer, run_seed)
     state_dim = env_adapter.state_dim
     action_dim = env_adapter.action_dim
 
+    # Separate eval environment so evaluation never corrupts training state
+    eval_env = MultimodalPointAdapter(
+        slip_prob=CONFIG["SLIP_PROB"],
+        deflection_angle=CONFIG["DEFLECTION_ANGLE"],
+        n_obstacles=CONFIG["N_OBSTACLES"],
+    )
+
     state_buffer = warmup_buffer.clone()
     agent = WorldModelAgent(config_name, CONFIG["ENV_NAME"],
                             state_dim, action_dim, device)
@@ -444,10 +522,23 @@ def train_single_run(config_name, horizon, env_adapter, warmup_buffer, run_seed)
     critic_target.load_state_dict(critic.state_dict())
     for p in critic_target.parameters():
         p.requires_grad = False
-    reward_model = RewardModel(state_dim, action_dim,
+    reward_model = TransitionRewardModel(state_dim, action_dim,
                                hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
+    # Load pretrained reward model if available (avoids garbage early signals)
+    pretrained_reward_path = _model_path(
+        f"pretrained_reward_{CONFIG['ENV_NAME']}.pth"
+    )
+    if os.path.exists(pretrained_reward_path):
+        reward_model.load_state_dict(torch.load(
+            pretrained_reward_path, map_location=device, weights_only=False
+        ))
+        print(f"    Loaded pretrained reward model from {pretrained_reward_path}")
 
-    actor_opt = optim.Adam(actor.parameters(), lr=CONFIG["LR_ACTOR"])
+    actor_lr = CONFIG["LR_ACTOR_EBM"] if config_name != "MDN" else CONFIG["LR_ACTOR"]
+    entropy_coeff = (CONFIG["ENTROPY_COEFF_EBM"]
+                     if config_name != "MDN" else CONFIG["ENTROPY_COEFF"])
+
+    actor_opt = optim.Adam(actor.parameters(), lr=actor_lr)
     critic_opt = optim.Adam(critic.parameters(), lr=CONFIG["LR_CRITIC"])
     reward_opt = optim.Adam(reward_model.parameters(), lr=CONFIG["LR_REWARD"])
 
@@ -456,8 +547,11 @@ def train_single_run(config_name, horizon, env_adapter, warmup_buffer, run_seed)
         ebm_opt = optim.Adam(agent.ebm.parameters(), lr=1e-4)
 
     eval_steps, eval_rewards = [], []
+    eval_reward_stds, eval_success_rates = [], []
     grad_norms, grad_norm_steps = [], []
     recent_grad_norms = []
+    recent_reward_maes = []
+    reward_maes, reward_mae_steps = [], []
 
     total_steps = 0
     episode_count = 0
@@ -485,8 +579,17 @@ def train_single_run(config_name, horizon, env_adapter, warmup_buffer, run_seed)
             state_buffer.finish_trajectory()
             episode_count += 1
             # Periodic online EBM update
-            if ebm_opt and episode_count % 5 == 0 and state_buffer.size >= 500:
-                update_ebm_online(agent.ebm, state_buffer, ebm_opt)
+            if (CONFIG["ENABLE_ONLINE_EBM_UPDATE"]
+                    and ebm_opt
+                    and episode_count % CONFIG["ONLINE_EBM_UPDATE_EVERY_EPISODES"] == 0
+                    and state_buffer.size >= 500):
+                update_ebm_online(
+                    agent.ebm,
+                    state_buffer,
+                    ebm_opt,
+                    num_steps=CONFIG["ONLINE_EBM_UPDATE_STEPS"],
+                    batch_size=32,
+                )
             state = env_adapter.reset()
         else:
             state = next_state
@@ -500,8 +603,10 @@ def train_single_run(config_name, horizon, env_adapter, warmup_buffer, run_seed)
                 CONFIG["BATCH_SIZE"], device
             )
             if batch:
-                pred_r = reward_model(batch['states'], batch['actions'])
+                pred_r = reward_model(batch['states'], batch['actions'], batch['next_states'])
                 loss_r = F.smooth_l1_loss(pred_r, batch['rewards'])
+                mae_r = torch.mean(torch.abs(pred_r.detach() - batch['rewards'])).item()
+                recent_reward_maes.append(mae_r)
                 reward_opt.zero_grad()
                 loss_r.backward()
                 reward_opt.step()
@@ -523,14 +628,16 @@ def train_single_run(config_name, horizon, env_adapter, warmup_buffer, run_seed)
                 # as the policy output to avoid objective mismatch.
                 entropy = squashed_gaussian_entropy(actor, curr, a_cont)
 
-                # Keep reward model in realistic environment scale.
-                r_pred = reward_model(curr, a_cont).clamp(-2.0, 12.0)
-
                 ns_pred = agent.predict_next_state(curr, a_cont)
                 ns_pred = torch.max(torch.min(ns_pred, obs_high), obs_low)
 
+                # r(s, a, s') — reward depends on the world-model-predicted
+                # next state, so mode-specific rewards (e.g. +10 goal bonus)
+                # are preserved instead of averaged away.
+                r_pred = reward_model(curr, a_cont, ns_pred).clamp(-2.0, 12.0)
+
                 states_list.append(curr)
-                rewards_list.append(r_pred + CONFIG["ENTROPY_COEFF"] * entropy)
+                rewards_list.append(r_pred + entropy_coeff * entropy)
                 next_states_list.append(ns_pred)
                 curr = ns_pred
 
@@ -566,9 +673,13 @@ def train_single_run(config_name, horizon, env_adapter, warmup_buffer, run_seed)
 
             # Actor update (pathwise gradient through world model)
             flat_ns_grad = next_states_seq.reshape(-1, state_dim)
-            v_next_pred = critic_target(flat_ns_grad).reshape(
+            for p in critic.parameters():
+                p.requires_grad = False
+            v_next_pred = critic(flat_ns_grad).reshape(
                 CONFIG["BATCH_SIZE"], horizon, 1
             )
+            for p in critic.parameters():
+                p.requires_grad = True
 
             actor_objective = rewards_seq + CONFIG["DISCOUNT"] * v_next_pred
             actor_loss = -actor_objective.mean()
@@ -599,11 +710,13 @@ def train_single_run(config_name, horizon, env_adapter, warmup_buffer, run_seed)
 
         # 3. Periodic evaluation
         if total_steps % CONFIG["EVAL_INTERVAL"] == 0:
-            eval_mean = evaluate_policy(
-                env_adapter, actor, CONFIG["EVAL_EPISODES"], device
+            eval_mean, eval_std, eval_success = evaluate_policy(
+                eval_env, actor, CONFIG["EVAL_EPISODES"], device
             )
             eval_steps.append(total_steps)
             eval_rewards.append(eval_mean)
+            eval_reward_stds.append(eval_std)
+            eval_success_rates.append(eval_success)
 
             if len(recent_grad_norms) > 0:
                 avg_gnorm = np.mean(recent_grad_norms)
@@ -611,16 +724,31 @@ def train_single_run(config_name, horizon, env_adapter, warmup_buffer, run_seed)
                 grad_norm_steps.append(total_steps)
                 recent_grad_norms = []
 
+            if len(recent_reward_maes) > 0:
+                avg_rmae = np.mean(recent_reward_maes)
+                reward_maes.append(avg_rmae)
+                reward_mae_steps.append(total_steps)
+                recent_reward_maes = []
+            else:
+                avg_rmae = None
+
             gn_str = (f" | GradNorm: {grad_norms[-1]:.4f}"
                       if grad_norms else "")
+            rmae_str = (f" | RModel MAE: {avg_rmae:.4f}"
+                        if avg_rmae is not None else "")
             print(f"    Step {total_steps:>5d} | "
-                  f"Eval: {eval_mean:.3f}{gn_str}")
+                  f"Eval: {eval_mean:.3f} ± {eval_std:.3f}"
+                  f" | Success: {eval_success*100:.1f}%{gn_str}{rmae_str}")
 
     return {
         'eval_steps': np.array(eval_steps),
         'eval_rewards': np.array(eval_rewards),
+        'eval_reward_stds': np.array(eval_reward_stds),
+        'eval_success_rates': np.array(eval_success_rates),
         'grad_norms': np.array(grad_norms),
         'grad_norm_steps': np.array(grad_norm_steps),
+        'reward_maes': np.array(reward_maes),
+        'reward_mae_steps': np.array(reward_mae_steps),
     }
 
 
@@ -826,22 +954,35 @@ def main():
         n_obstacles=CONFIG["N_OBSTACLES"],
     )
 
-    # Warmup: collect initial transitions with random policy (first seed)
-    print("Collecting warmup data...")
+    # Warmup: collect initial transitions with random policy.
+    # Keep collecting until we have at least MIN_POSITIVES goal-reaching
+    # transitions (or hit MAX_WARMUP_STEPS).  This guarantees the reward
+    # model and imagination buffer see the +10 bonus from step 0.
+    MIN_POSITIVES = 10
+    MAX_WARMUP_STEPS = 8000
+    print("Collecting warmup data (until ≥{} positives)...".format(MIN_POSITIVES))
     np.random.seed(CONFIG["SEEDS"][0])
     warmup_buffer = TrajectoryBuffer(env_adapter.state_dim, env_adapter.action_dim)
     state = env_adapter.reset()
-    for i in range(CONFIG["WARMUP_STEPS"]):
+    warmup_steps = 0
+    while (len(warmup_buffer.positive_indices) < MIN_POSITIVES
+           and warmup_steps < MAX_WARMUP_STEPS):
         action = env_adapter.env.action_space.sample()
         ns, r, d, info = env_adapter.step(action)
         warmup_buffer.add_transition(state, action, r, ns)
+        warmup_steps += 1
         if d:
             warmup_buffer.finish_trajectory()
             state = env_adapter.reset()
         else:
             state = ns
+        if warmup_steps % 1000 == 0:
+            print(f"  Warmup step {warmup_steps}: "
+                  f"{warmup_buffer.size} transitions, "
+                  f"{len(warmup_buffer.positive_indices)} positives")
     warmup_buffer.finish_trajectory()
-    print(f"  Warmup done: {warmup_buffer.size} transitions collected\n")
+    print(f"  Warmup done: {warmup_buffer.size} transitions, "
+          f"{len(warmup_buffer.positive_indices)} positives\n")
 
     # Run all (config, horizon, seed) combinations
     all_results = {}
