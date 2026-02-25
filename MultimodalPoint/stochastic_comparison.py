@@ -75,7 +75,7 @@ CONFIG = {
     "DISCOUNT": 0.99,
     "LAMBDA": 0.95,
     "LR_ACTOR": 1e-4,
-    "LR_ACTOR_EBM": 2e-4,
+    "LR_ACTOR_EBM": 5e-4,
     "LR_CRITIC": 1e-3,
     "LR_REWARD": 1e-3,
     "ENTROPY_COEFF": 0.03,
@@ -89,7 +89,7 @@ CONFIG = {
     # directly amplifies through MDN’s clean forward pass, causing
     # exponential gradient growth even at H=1. EBM’s Langevin noise
     # naturally smooths this.
-    "GRAD_CLIP_NORM_EBM": 1.0,
+    "GRAD_CLIP_NORM_EBM": 0.3,
     "GRAD_CLIP_NORM_MDN": 1.0,
 
     # Sampling
@@ -225,9 +225,11 @@ class TrajectoryBuffer:
         states_list = []
         num_pos = len(self.positive_indices)
 
-        # 1. POSITIVES (50% of batch when available)
+        # 1. POSITIVES (20% of batch when available — kept low to avoid
+        #    concentrating imagination in the high-gradient near-goal region
+        #    where reward model sharpening causes gradient spikes)
         if num_pos > 0:
-            n_pos = batch_size // 2
+            n_pos = batch_size // 5
             idx_pos = np.random.choice(self.positive_indices, size=n_pos, replace=True)
             states_list.append(self.states[idx_pos])
             n_remaining = batch_size - n_pos
@@ -257,9 +259,10 @@ class TrajectoryBuffer:
     def sample_for_reward_training(self, batch_size, device):
         """Sample transitions for reward model training.
 
-        When positive (goal-reaching) transitions exist, 50% of the batch
+        When positive (goal-reaching) transitions exist, 30% of the batch
         is drawn from them.  This prevents the reward model from under-
-        fitting the rare +100 goal reward that drives the entire task.
+        fitting the rare +100 goal reward while avoiding over-sharpening
+        the reward gradient near the goal boundary.
 
         Returns (s, a, s', r) so the TransitionRewardModel can learn r(s,a,s').
         """
@@ -267,9 +270,9 @@ class TrajectoryBuffer:
             return None
         num_pos = len(self.positive_indices)
         if num_pos > 0:
-            half = batch_size // 2
-            pos_idx = np.random.choice(self.positive_indices, size=half, replace=True)
-            rand_idx = np.random.randint(0, self.size, size=batch_size - half)
+            n_pos = max(1, batch_size * 3 // 10)  # 30%
+            pos_idx = np.random.choice(self.positive_indices, size=n_pos, replace=True)
+            rand_idx = np.random.randint(0, self.size, size=batch_size - n_pos)
             idx = np.concatenate([pos_idx, rand_idx])
             np.random.shuffle(idx)
         else:
@@ -716,27 +719,29 @@ def train_single_run(config_name, horizon, env_adapter, warmup_buffer, run_seed)
 
             actor_objective = rewards_seq + CONFIG["DISCOUNT"] * v_next_pred
 
-            # Advantage baseline subtraction (all configs) — reduces
-            # variance without changing gradient direction.
+            # Advantage normalisation (all configs).
+            #
+            # Both MDN and EBM gradients grow as the reward model sharpens
+            # (∂r/∂s' near the +100 goal cliff increases over training):
+            #   MDN: raw grad 7 → 60   (clean forward pass)
+            #   EBM: raw grad 6 → 1300 (truncated backprop bounds the
+            #         Langevin chain, but EBM samples at mode peaks near
+            #         the goal cliff where ∂r/∂s' is steepest)
+            #
+            # Baseline subtraction + std-division keeps gradient magnitude
+            # bounded for both.  EBM's LR is set higher (5e-4) to
+            # compensate for its smaller post-normalisation gradients.
             with torch.no_grad():
                 v_baseline = critic_target(
                     states_seq.reshape(-1, state_dim)
                 ).reshape(CONFIG["BATCH_SIZE"], horizon, 1)
             advantage = actor_objective - v_baseline
-
-            # Std-normalisation: only MDN needs this.
-            #   MDN's clean forward pass has unbounded ∂s'/∂a, so the raw
-            #   gradient grows as the reward model sharpens (7 → 60).
-            #   Dividing by adv_std (~20-30) keeps it bounded.
-            #
-            #   EBM uses truncated backprop (single-step Jacobian), which
-            #   already bounds gradients (~1-2).  Dividing by adv_std would
-            #   reduce them to ~0.04 — too weak to learn.
-            if config_name == "MDN":
-                adv_std = advantage.std().detach().clamp(min=1.0)
-                actor_loss = -(advantage / adv_std).mean()
-            else:
-                actor_loss = -advantage.mean()
+            adv_std = advantage.std().detach().clamp(min=1.0)
+            # Per-sample advantage clipping: prevent extreme outlier samples
+            # (e.g. near the +100 goal cliff) from dominating the gradient
+            # direction after std-normalization.
+            normed_adv = (advantage / adv_std).clamp(-5.0, 5.0)
+            actor_loss = -normed_adv.mean()
 
             actor_opt.zero_grad()
             actor_loss.backward()
