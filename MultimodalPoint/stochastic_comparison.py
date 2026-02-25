@@ -70,34 +70,39 @@ CONFIG = {
     "HORIZONS": [1, 5],
 
     # Training
-    "TOTAL_STEPS": 30000,
+    "TOTAL_STEPS": 60000,
     "BATCH_SIZE": 256,
     "DISCOUNT": 0.99,
     "LAMBDA": 0.95,
     "LR_ACTOR": 1e-4,
-    "LR_ACTOR_EBM": 5e-5,
-    "LR_CRITIC": 3e-4,
+    "LR_ACTOR_EBM": 2e-4,
+    "LR_CRITIC": 1e-3,
     "LR_REWARD": 1e-3,
-    "ENTROPY_COEFF": 0.003,
-    "ENTROPY_COEFF_EBM": 0.007,
+    "ENTROPY_COEFF": 0.03,
+    "ENTROPY_COEFF_EBM": 0.03,
     "UPDATE_FREQ": 10,
 
     # Gradient clipping — applied AFTER logging raw norm, preserving full
     # computation graph (E2E differentiability is unaffected; only caps magnitude).
-    # Set to None to disable.
-    "GRAD_CLIP_NORM": 0.5,
+    # Set to None to disable.  Per-config: MDN has no Langevin dampening so
+    # the reward model’s sharpening Jacobian (near the +100 goal cliff)
+    # directly amplifies through MDN’s clean forward pass, causing
+    # exponential gradient growth even at H=1. EBM’s Langevin noise
+    # naturally smooths this.
+    "GRAD_CLIP_NORM_EBM": 1.0,
+    "GRAD_CLIP_NORM_MDN": 1.0,
 
     # Sampling
-    "LANGEVIN_STEPS_COLD": 25,
+    "LANGEVIN_STEPS_COLD": 10,
     "LANGEVIN_STEPS_WARM": 5,
-    "LANGEVIN_STEP_SIZE": 0.02,
-    "LANGEVIN_NOISE_SCALE": 0.005,
+    "LANGEVIN_STEP_SIZE": 0.05,
+    "LANGEVIN_NOISE_SCALE": 0.01,
 
-    # Online EBM finetuning during policy learning can cause world-model drift.
-    # Keep disabled by default; pretraining quality is usually enough here.
-    "ENABLE_ONLINE_EBM_UPDATE": False,
-    "ONLINE_EBM_UPDATE_EVERY_EPISODES": 10,
-    "ONLINE_EBM_UPDATE_STEPS": 20,
+    # Online EBM finetuning keeps the energy landscape calibrated as the
+    # policy visits new state-action regions not seen during pretraining.
+    "ENABLE_ONLINE_EBM_UPDATE": True,
+    "ONLINE_EBM_UPDATE_EVERY_EPISODES": 5,
+    "ONLINE_EBM_UPDATE_STEPS": 100,
 
     # Evaluation
     "EVAL_INTERVAL": 1000,
@@ -161,7 +166,7 @@ def squashed_gaussian_entropy(actor, state, squashed_action, eps=1e-6):
 class TrajectoryBuffer:
     """Buffer storing (s, a, r, s') transitions for continuous env."""
 
-    def __init__(self, state_dim, action_dim, capacity=50000):
+    def __init__(self, state_dim, action_dim, capacity=100000):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.capacity = capacity
@@ -184,8 +189,8 @@ class TrajectoryBuffer:
         self.actions[self.ptr] = action
         self.rewards[self.ptr] = reward
         self.next_states[self.ptr] = next_state
-        # Track high-reward transitions (goal bonus > 5.0) for priority sampling
-        if reward > 5.0:
+        # Track high-reward transitions (goal bonus > 50) for priority sampling
+        if reward > 50.0:
             if self.ptr not in self.positive_indices:
                 self.positive_indices.append(self.ptr)
         else:
@@ -212,7 +217,7 @@ class TrajectoryBuffer:
         Prioritized sampling: 50% from positive (goal-reaching) transitions
         when available, remainder from recent trajectories / random buffer.
         This ensures the agent imagines successful trajectories and
-        propagates the sparse +10 goal reward signal.
+        propagates the +100 goal reward signal.
         """
         if self.size == 0:
             return torch.randn(batch_size, self.state_dim).to(device)
@@ -254,7 +259,7 @@ class TrajectoryBuffer:
 
         When positive (goal-reaching) transitions exist, 50% of the batch
         is drawn from them.  This prevents the reward model from under-
-        fitting the rare +10 goal bonus that drives the entire task.
+        fitting the rare +100 goal reward that drives the entire task.
 
         Returns (s, a, s', r) so the TransitionRewardModel can learn r(s,a,s').
         """
@@ -479,17 +484,22 @@ def update_ebm_online(ebm, buffer, optimizer, num_steps=50, batch_size=32):
     """Fine-tune EBM on newly collected transitions."""
     ebm.train()
     if buffer.size < batch_size:
-        return
+        return {}
+    losses = []
+    gap = 0
     for _ in range(num_steps):
         data = buffer.sample(batch_size)
         if data is None:
-            return
+            return {}
         s, a, real_ns = data
-        loss, _ = infonce_loss(ebm, s, a, real_ns, buffer,
-                               num_negatives=32, temperature=0.1)
+        loss, metrics = infonce_loss(ebm, s, a, real_ns, buffer,
+                                     num_negatives=32, temperature=0.1)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        losses.append(loss.item())
+        gap = metrics['E_gap']
+    return {'loss': np.mean(losses), 'E_gap': gap}
 
 
 # =============================================================================
@@ -583,13 +593,16 @@ def train_single_run(config_name, horizon, env_adapter, warmup_buffer, run_seed)
                     and ebm_opt
                     and episode_count % CONFIG["ONLINE_EBM_UPDATE_EVERY_EPISODES"] == 0
                     and state_buffer.size >= 500):
-                update_ebm_online(
+                ebm_metrics = update_ebm_online(
                     agent.ebm,
                     state_buffer,
                     ebm_opt,
                     num_steps=CONFIG["ONLINE_EBM_UPDATE_STEPS"],
                     batch_size=32,
                 )
+                if ebm_metrics and episode_count % 20 == 0:
+                    print(f"    [EBM Online] Gap: {ebm_metrics['E_gap']:.4f} "
+                          f"Loss: {ebm_metrics['loss']:.4f}")
             state = env_adapter.reset()
         else:
             state = next_state
@@ -617,6 +630,12 @@ def train_single_run(config_name, horizon, env_adapter, warmup_buffer, run_seed)
             )
             curr = initial_states
             states_list, rewards_list, next_states_list = [], [], []
+            dones_list = []
+            # Track which imagined trajectories have already terminated
+            # so we (a) zero rewards after termination and (b) pass correct
+            # done flags to lambda returns (V(terminal) = 0).
+            already_done = torch.zeros(CONFIG["BATCH_SIZE"], 1, device=device)
+            goal_threshold = getattr(env_adapter.env, 'goal_threshold', 0.15)
 
             for t in range(horizon):
                 # Clip actor output to env action space [-1, 1]
@@ -632,19 +651,33 @@ def train_single_run(config_name, horizon, env_adapter, warmup_buffer, run_seed)
                 ns_pred = torch.max(torch.min(ns_pred, obs_high), obs_low)
 
                 # r(s, a, s') — reward depends on the world-model-predicted
-                # next state, so mode-specific rewards (e.g. +10 goal bonus)
+                # next state, so mode-specific rewards (e.g. +100 goal bonus)
                 # are preserved instead of averaged away.
-                r_pred = reward_model(curr, a_cont, ns_pred).clamp(-2.0, 12.0)
+                r_pred = reward_model(curr, a_cont, ns_pred).clamp(-3.0, 110.0)
+
+                # Zero out rewards for trajectories that already terminated
+                # in a PREVIOUS step (current step's terminal reward is kept).
+                effective_reward = (r_pred + entropy_coeff * entropy) * (1.0 - already_done)
+
+                # Detect termination: agent within goal_threshold of goal.
+                # State layout: [x, y, goal_x, goal_y, ...]
+                agent_pos = ns_pred[:, 0:2]
+                goal_pos = ns_pred[:, 2:4]
+                dist_to_goal = torch.norm(agent_pos - goal_pos, dim=1, keepdim=True)
+                step_terminated = (dist_to_goal < goal_threshold).float()
+                # Once done, stay done
+                already_done = torch.max(already_done, step_terminated)
 
                 states_list.append(curr)
-                rewards_list.append(r_pred + entropy_coeff * entropy)
+                rewards_list.append(effective_reward)
                 next_states_list.append(ns_pred)
+                dones_list.append(already_done.clone())
                 curr = ns_pred
 
             states_seq = torch.stack(states_list, dim=1)
             rewards_seq = torch.stack(rewards_list, dim=1)
             next_states_seq = torch.stack(next_states_list, dim=1)
-            dones = torch.zeros(CONFIG["BATCH_SIZE"], horizon, 1, device=device)
+            dones = torch.stack(dones_list, dim=1)
 
             # Critic update (TD-lambda)
             flat_next_states = next_states_seq.reshape(-1, state_dim)
@@ -682,7 +715,27 @@ def train_single_run(config_name, horizon, env_adapter, warmup_buffer, run_seed)
                 p.requires_grad = True
 
             actor_objective = rewards_seq + CONFIG["DISCOUNT"] * v_next_pred
-            actor_loss = -actor_objective.mean()
+
+            # Advantage normalisation (all configs).
+            #
+            # Both MDN and EBM suffer from unbounded gradient growth as the
+            # reward model / critic sharpen during training:
+            #   MDN:  clean forward pass amplifies ∂r/∂s'  (7 → 60)
+            #   EBM:  differentiable Langevin chain is a PRODUCT of K
+            #         Jacobians (I + η·H_E).  When any eigenvalue of the
+            #         energy Hessian H_E exceeds 1/η, this product explodes
+            #         exponentially  (12 → 4,000,000).
+            #
+            # Baseline subtraction centres the objective; std-division
+            # keeps gradient magnitude bounded regardless of value scale.
+            with torch.no_grad():
+                v_baseline = critic_target(
+                    states_seq.reshape(-1, state_dim)
+                ).reshape(CONFIG["BATCH_SIZE"], horizon, 1)
+            advantage = actor_objective - v_baseline
+            adv_std = advantage.std().detach().clamp(min=1.0)
+            actor_loss = -(advantage / adv_std).mean()
+
             actor_opt.zero_grad()
             actor_loss.backward()
 
@@ -698,9 +751,12 @@ def train_single_run(config_name, horizon, env_adapter, warmup_buffer, run_seed)
             total_norm = total_norm ** 0.5
             recent_grad_norms.append(total_norm)
 
-            if CONFIG["GRAD_CLIP_NORM"] is not None:
+            clip_norm = (CONFIG["GRAD_CLIP_NORM_MDN"]
+                        if config_name == "MDN"
+                        else CONFIG["GRAD_CLIP_NORM_EBM"])
+            if clip_norm is not None:
                 torch.nn.utils.clip_grad_norm_(
-                    actor.parameters(), max_norm=CONFIG["GRAD_CLIP_NORM"]
+                    actor.parameters(), max_norm=clip_norm
                 )
             actor_opt.step()
 
@@ -785,6 +841,55 @@ def plot_results(all_results, save_dir):
 
     smooth_window = 5
 
+    # FIGURE 0: Success Rate — PRIMARY METRIC
+    fig0, axes0 = plt.subplots(1, n_h, figsize=(6 * n_h, 5.5), sharey=True)
+    if n_h == 1:
+        axes0 = [axes0]
+    fig0.suptitle(
+        f"Continuous Multimodal Env (slip={CONFIG['SLIP_PROB']}): "
+        f"Goal Success Rate"
+        f" (mean \u00b1 std, {n_seeds} seeds)",
+        fontsize=13, fontweight='bold', y=1.02
+    )
+
+    for i, H in enumerate(horizons):
+        ax = axes0[i]
+        for config_name in configs:
+            agg = aggregate_seeds(all_results, config_name, H)
+            if agg is None or len(agg['success_mean']) == 0:
+                continue
+            steps = agg['steps']
+            mean_sr = agg['success_mean'] * 100
+            std_sr = agg['success_std'] * 100
+
+            smoothed, offset = smooth_curve(mean_sr, smooth_window)
+            smooth_steps = steps[offset:]
+            smooth_std = std_sr[offset:]
+
+            c = colors[config_name]
+            ax.plot(smooth_steps, smoothed, color=c,
+                    linestyle=linestyles[config_name], linewidth=2.5,
+                    label=config_name, zorder=2)
+            ax.fill_between(smooth_steps,
+                            np.maximum(smoothed - smooth_std, 0),
+                            np.minimum(smoothed + smooth_std, 100),
+                            color=c, alpha=0.15, zorder=1)
+
+        ax.set_title(f"Horizon = {H}", fontsize=13, fontweight='bold')
+        ax.set_xlabel("Training Steps", fontsize=11)
+        if i == 0:
+            ax.set_ylabel("Success Rate (%)", fontsize=11)
+        ax.set_ylim(-5, 105)
+        ax.grid(True, alpha=0.25, linestyle='--')
+        ax.legend(fontsize=10, loc='upper left', framealpha=0.9)
+        ax.tick_params(labelsize=9)
+
+    fig0.tight_layout()
+    path0 = os.path.join(save_dir, "continuous_stochastic_success_rate.png")
+    fig0.savefig(path0, dpi=200, bbox_inches='tight')
+    print(f"Saved: {path0}")
+    plt.close(fig0)
+
     # FIGURE 1: Policy Convergence (mean ± std across seeds)
     fig1, axes1 = plt.subplots(1, n_h, figsize=(6 * n_h, 5.5), sharey=True)
     if n_h == 1:
@@ -792,7 +897,7 @@ def plot_results(all_results, save_dir):
     fig1.suptitle(
         f"Continuous Multimodal Env (slip={CONFIG['SLIP_PROB']}): "
         f"Explicit vs EBM Policy Convergence"
-        f" (mean \u00b1 std, {n_seeds} seeds, clip={CONFIG['GRAD_CLIP_NORM']})",
+        f" (mean \u00b1 std, {n_seeds} seeds, clip=EBM:{CONFIG['GRAD_CLIP_NORM_EBM']}/MDN:{CONFIG['GRAD_CLIP_NORM_MDN']})",
         fontsize=13, fontweight='bold', y=1.02
     )
 
@@ -892,7 +997,7 @@ def aggregate_seeds(all_results, config_name, horizon):
     Collect per-seed results for a (config_name, horizon) pair and return
     mean ± std arrays interpolated onto a common step grid.
     """
-    seed_rewards, seed_gnorms = [], []
+    seed_rewards, seed_gnorms, seed_success = [], [], []
     ref_steps = None
 
     for seed in CONFIG["SEEDS"]:
@@ -909,18 +1014,23 @@ def aggregate_seeds(all_results, config_name, horizon):
         if len(r['grad_norms']) > 0:
             gn_steps = r['grad_norm_steps']
             seed_gnorms.append(np.interp(ref_steps, gn_steps, r['grad_norms']))
+        if 'eval_success_rates' in r and len(r['eval_success_rates']) > 0:
+            seed_success.append(np.interp(ref_steps, steps, r['eval_success_rates']))
 
     if ref_steps is None or len(seed_rewards) == 0:
         return None
 
     rw = np.array(seed_rewards)
     gn = np.array(seed_gnorms) if seed_gnorms else None
+    sr = np.array(seed_success) if seed_success else None
     return {
         'steps': ref_steps,
         'reward_mean': rw.mean(axis=0),
         'reward_std': rw.std(axis=0),
         'gnorm_mean': gn.mean(axis=0) if gn is not None else np.array([]),
         'gnorm_std': gn.std(axis=0) if gn is not None else np.array([]),
+        'success_mean': sr.mean(axis=0) if sr is not None else np.array([]),
+        'success_std': sr.std(axis=0) if sr is not None else np.array([]),
     }
 
 
@@ -943,7 +1053,7 @@ def main():
     print(f"  Seeds:       {CONFIG['SEEDS']}")
     print(f"  Steps/run:   {CONFIG['TOTAL_STEPS']}")
     print(f"  Total runs:  {total_runs}")
-    print(f"  Grad clip:   {CONFIG['GRAD_CLIP_NORM']}")
+    print(f"  Grad clip:   EBM={CONFIG['GRAD_CLIP_NORM_EBM']}, MDN={CONFIG['GRAD_CLIP_NORM_MDN']}")
     print(f"  Device:      {device}")
     print(f"{'='*70}\n")
 
