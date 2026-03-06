@@ -94,10 +94,10 @@ CONFIG = {
 
 
 # =============================================================================
-# REAL REPLAY BUFFER (for world model training + reward model + diagnostics)
+# REAL REPLAY BUFFER (Updated to track state statistics for TrustComputer)
 # =============================================================================
 class ReplayBuffer:
-    """Stores REAL environment transitions."""
+    """Stores REAL environment transitions and computes rolling stats."""
     def __init__(self, state_dim, action_dim, capacity=100000):
         self.capacity = capacity
         self.ptr = 0
@@ -108,6 +108,11 @@ class ReplayBuffer:
         self.actions = np.zeros((capacity, action_dim), dtype=np.float32)
         self.rewards = np.zeros((capacity, 1), dtype=np.float32)
         self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
+        
+        # Tracking running statistics for Z-score Trust filtering
+        self._state_sum = np.zeros(state_dim, dtype=np.float64)
+        self._state_sq_sum = np.zeros(state_dim, dtype=np.float64)
+        self._state_count = 0
 
     def add(self, s, a, r, ns):
         self.states[self.ptr] = s
@@ -116,6 +121,10 @@ class ReplayBuffer:
         self.next_states[self.ptr] = ns
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
+        
+        self._state_sum += ns.astype(np.float64)
+        self._state_sq_sum += (ns.astype(np.float64)) ** 2
+        self._state_count += 1
 
     def sample(self, batch_size):
         idx = np.random.randint(0, self.size, size=batch_size)
@@ -131,65 +140,73 @@ class ReplayBuffer:
         idx = np.random.randint(0, self.size, size=batch_size)
         return torch.tensor(self.states[idx], device=CONFIG["DEVICE"])
 
+    @property
+    def state_mean(self):
+        if self._state_count == 0:
+            return np.zeros(self.state_dim, dtype=np.float32)
+        return (self._state_sum / self._state_count).astype(np.float32)
+
+    @property
+    def state_std(self):
+        if self._state_count < 2:
+            return np.ones(self.state_dim, dtype=np.float32)
+        mean = self._state_sum / self._state_count
+        var = self._state_sq_sum / self._state_count - mean ** 2
+        return np.sqrt(np.clip(var, 1e-6, None)).astype(np.float32)
+
 
 # =============================================================================
-# TD(lambda) RETURNS
+# TRUST COMPUTER (The Safeguard against Model Exploitation)
 # =============================================================================
-def compute_lambda_returns(rewards, values, discount, lam):
+class TrustComputer:
+    """Calculates trust weight based on Z-score distance from real states."""
+    def __init__(self, buffer, threshold=3.0, sharpness=2.0):
+        self.buffer = buffer
+        self.threshold = threshold
+        self.sharpness = sharpness
+
+    def compute_trust(self, predicted_states):
+        device = predicted_states.device
+        mean = torch.tensor(self.buffer.state_mean, device=device)
+        std = torch.tensor(self.buffer.state_std, device=device)
+        z = (predicted_states - mean) / std
+        z_norm = torch.norm(z, dim=-1, keepdim=True)
+        return torch.sigmoid(self.sharpness * (self.threshold - z_norm))
+
+
+# =============================================================================
+# TD(lambda) RETURNS (Updated to penalize using Trust weights)
+# =============================================================================
+def compute_lambda_returns(rewards, values, trust, discount, lam):
     B, H = rewards.shape
     returns = torch.zeros_like(rewards)
     for t in reversed(range(H)):
+        # THE FIX: Trust exponentially decays the discount factor for OOD states
+        eff_gamma = discount * trust[:, t] 
         if t == H - 1:
-            returns[:, t] = rewards[:, t] + discount * values[:, t]
+            returns[:, t] = rewards[:, t] + eff_gamma * values[:, t]
         else:
-            td1 = rewards[:, t] + discount * values[:, t]
-            cont = rewards[:, t] + discount * returns[:, t + 1]
+            td1 = rewards[:, t] + eff_gamma * values[:, t]
+            cont = rewards[:, t] + eff_gamma * returns[:, t + 1]
             returns[:, t] = (1 - lam) * td1 + lam * cont
     return returns
 
 
 # =============================================================================
-# RETURN NORMALIZER — prevents critic loss scale from growing with value scale
+# SYMLOG / SYMEXP
 # =============================================================================
-class ReturnNormalizer:
-    """Running mean/std normalization for critic targets.
+def symlog(x):
+    return torch.sign(x) * torch.log1p(torch.abs(x))
 
-    Without this, critic MSE grows as the magnitude of returns grows
-    (e.g. from -100 to -500 range), creating a positive feedback loop:
-    bigger loss -> bigger gradients -> bigger values -> bigger loss.
-    """
-    def __init__(self, decay=0.99, eps=1e-8):
-        self.mean = 0.0
-        self.var = 1.0
-        self.decay = decay
-        self.eps = eps
-        self.count = 0
-
-    def update(self, returns):
-        """Update running stats with a batch of returns."""
-        batch_mean = returns.mean().item()
-        batch_var = returns.var().item()
-        if self.count == 0:
-            self.mean = batch_mean
-            self.var = batch_var
-        else:
-            self.mean = self.decay * self.mean + (1 - self.decay) * batch_mean
-            self.var = self.decay * self.var + (1 - self.decay) * batch_var
-        self.count += 1
-
-    def normalize(self, x):
-        return (x - self.mean) / (self.var ** 0.5 + self.eps)
-
-    def denormalize(self, x):
-        return x * (self.var ** 0.5 + self.eps) + self.mean
+def symexp(x):
+    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
 
 
 # =============================================================================
-# PREDICTION ACCURACY MONITOR (uses REAL data — diagnostic)
+# PREDICTION ACCURACY MONITOR
 # =============================================================================
 @torch.no_grad()
 def evaluate_prediction_accuracy(agent, buffer, num_samples=512):
-    """Evaluate WM prediction vs REAL transitions (diagnostic)."""
     if buffer.size < num_samples:
         return None
     batch = buffer.sample(num_samples)
@@ -200,17 +217,9 @@ def evaluate_prediction_accuracy(agent, buffer, num_samples=512):
 
 
 # =============================================================================
-# WORLD MODEL AGENT — Single model, trained on REAL data online
+# WORLD MODEL AGENT
 # =============================================================================
 class WorldModelAgent:
-    """
-    Single world model agent. Trained online on real environment data.
-
-    Architecture-specific details:
-      - EBM (Langevin): 1 EBM + 1 Flow (Flow provides init, EBM refines)
-      - Flow: 1 Flow
-      - MDN: 1 MDN
-    """
     def __init__(self, agent_type, state_dim, action_dim, device):
         self.agent_type = agent_type
         self.device = device
@@ -224,7 +233,6 @@ class WorldModelAgent:
         self.flow = None
         self.mdn = None
 
-        # Load pretrained checkpoints
         if agent_type == "EBM (Langevin)":
             self.ebm = BilinearEBM(state_dim, action_dim, hidden_dim=hd).to(device)
             self.ebm.load_state_dict(torch.load(
@@ -260,20 +268,7 @@ class WorldModelAgent:
 
             self.wm_optimizer = optim.Adam(self.mdn.parameters(), lr=lr)
 
-    # ----- Differentiable prediction (for actor gradient flow) -----
-
     def predict_next_state(self, state, action, differentiable=True):
-        """
-        Predict next state.
-
-        For EBM (Langevin): Flow provides init, Langevin refines via EBM
-        energy gradients. With full backprop through all Langevin steps,
-        the gradient chain is:
-            actor -> action -> flow_init -> Langevin(EBM) -> prediction
-        The actor learns through the EBM's energy landscape directly.
-
-        differentiable=False is used for diagnostics under @torch.no_grad.
-        """
         if self.agent_type == "EBM (Langevin)":
             with torch.enable_grad():
                 return langevin_refine(
@@ -298,13 +293,7 @@ class WorldModelAgent:
         else:
             raise ValueError(f"Unknown: {self.agent_type}")
 
-    # ----- World model update (REAL data) -----
-
     def update_world_model(self, real_buffer):
-        """
-        One gradient step using REAL transitions from the replay buffer.
-        Standard online model learning.
-        """
         BS = CONFIG["WM_UPDATE_BATCH"]
         if real_buffer.size < BS:
             return {}
@@ -321,10 +310,8 @@ class WorldModelAgent:
         loss = torch.tensor(0.0, device=self.device)
 
         if self.ebm is not None:
-            # --- EBM: InfoNCE ---
             self.ebm.train()
             E_pos = self.ebm(s, a, ns)
-            # Sample negatives from the real buffer
             neg_idx = np.random.randint(0, real_buffer.size, (B, CONFIG["NUM_NEGATIVES"]))
             neg_ns = torch.tensor(
                 real_buffer.next_states[neg_idx], device=self.device
@@ -344,75 +331,50 @@ class WorldModelAgent:
                 metrics["ebm_acc"] = (logits.argmax(dim=1) == 0).float().mean().item()
 
         if self.flow is not None:
-            # --- Flow: Forward KL ---
             self.flow.train()
             context = torch.cat([s, a], dim=1)
             log_prob = self.flow.log_prob(ns, context=context)
             flow_loss = -log_prob.mean() / self.state_dim
             loss = loss + flow_loss
-
-            with torch.no_grad():
-                metrics["flow_loss"] = flow_loss.item()
+            with torch.no_grad(): metrics["flow_loss"] = flow_loss.item()
 
         if self.mdn is not None:
-            # --- MDN: NLL ---
             self.mdn.train()
             mdn_ll = self.mdn.log_prob(s, a, ns)
             mdn_loss = -mdn_ll.mean() / self.state_dim
             loss = loss + mdn_loss
-
-            with torch.no_grad():
-                metrics["mdn_loss"] = mdn_loss.item()
+            with torch.no_grad(): metrics["mdn_loss"] = mdn_loss.item()
 
         loss.backward()
 
-        if self.ebm is not None:
-            torch.nn.utils.clip_grad_norm_(self.ebm.parameters(), 1.0)
-        if self.flow is not None:
-            torch.nn.utils.clip_grad_norm_(self.flow.parameters(), 1.0)
-        if self.mdn is not None:
-            torch.nn.utils.clip_grad_norm_(self.mdn.parameters(), 1.0)
+        if self.ebm is not None: torch.nn.utils.clip_grad_norm_(self.ebm.parameters(), 1.0)
+        if self.flow is not None: torch.nn.utils.clip_grad_norm_(self.flow.parameters(), 1.0)
+        if self.mdn is not None: torch.nn.utils.clip_grad_norm_(self.mdn.parameters(), 1.0)
 
         self.wm_optimizer.step()
 
-        # Back to eval mode
-        if self.ebm is not None:
-            self.ebm.eval()
-        if self.flow is not None:
-            self.flow.eval()
-        if self.mdn is not None:
-            self.mdn.eval()
+        if self.ebm is not None: self.ebm.eval()
+        if self.flow is not None: self.flow.eval()
+        if self.mdn is not None: self.mdn.eval()
 
         return metrics
 
     def freeze_for_rollout(self):
-        """
-        Freeze world model params so actor/critic grads don't corrupt them.
-        EBM (Langevin) keeps EBM unfrozen — Langevin needs autograd.grad.
-        """
         if self.ebm is not None:
             if self.agent_type != "EBM (Langevin)":
-                for p in self.ebm.parameters():
-                    p.requires_grad = False
+                for p in self.ebm.parameters(): p.requires_grad = False
         if self.flow is not None:
-            for p in self.flow.parameters():
-                p.requires_grad = False
+            for p in self.flow.parameters(): p.requires_grad = False
         if self.mdn is not None:
-            for p in self.mdn.parameters():
-                p.requires_grad = False
+            for p in self.mdn.parameters(): p.requires_grad = False
 
     def unfreeze_after_rollout(self):
-        """Restore requires_grad and zero stray gradients."""
         if self.ebm is not None:
-            for p in self.ebm.parameters():
-                p.requires_grad = True
+            for p in self.ebm.parameters(): p.requires_grad = True
         if self.flow is not None:
-            for p in self.flow.parameters():
-                p.requires_grad = True
+            for p in self.flow.parameters(): p.requires_grad = True
         if self.mdn is not None:
-            for p in self.mdn.parameters():
-                p.requires_grad = True
-        # Clear stray gradients from actor rollout
+            for p in self.mdn.parameters(): p.requires_grad = True
         self.wm_optimizer.zero_grad()
 
 
@@ -453,7 +415,6 @@ def train_agent(agent_type, horizon):
     print(f"Agent: {agent_type} | Horizon: {horizon}")
     print(f"{'='*60}")
 
-    # --- Components ---
     agent = WorldModelAgent(agent_type, state_dim, action_dim, device)
 
     actor = Actor(state_dim, action_dim, hidden_dim=CONFIG["HIDDEN_DIM"],
@@ -469,12 +430,11 @@ def train_agent(agent_type, horizon):
     critic_opt = optim.Adam(critic.parameters(), lr=CONFIG["LR_CRITIC"])
     reward_opt = optim.Adam(reward_model.parameters(), lr=CONFIG["LR_REWARD"])
 
-    ret_normalizer = ReturnNormalizer()
-
-    # REAL buffer — world model training + reward model + diagnostics
     real_buffer = ReplayBuffer(state_dim, action_dim)
+    
+    # Initialize TrustComputer
+    trust_comp = TrustComputer(real_buffer, threshold=3.0, sharpness=2.0)
 
-    # --- Seed real buffer with random data ---
     print("Collecting 2000 random transitions for initial buffer...")
     state, _ = env.reset()
     for _ in range(2000):
@@ -483,7 +443,6 @@ def train_agent(agent_type, horizon):
         real_buffer.add(state, a, r, ns)
         state = ns if not (term or trunc) else env.reset()[0]
 
-    # --- Histories ---
     eval_steps, eval_rewards = [], []
     diag_log = []
 
@@ -508,7 +467,7 @@ def train_agent(agent_type, horizon):
                 parts = [f"{k}={v:.4f}" for k, v in wm_metrics.items()]
                 print(f"  [WM Update (real)] {' | '.join(parts)}")
 
-        # ==== 3. REWARD MODEL UPDATE (REAL data — needs ground-truth rewards) ====
+        # ==== 3. REWARD MODEL UPDATE ====
         if real_buffer.size >= CONFIG["BATCH_SIZE"] and total_steps % 5 == 0:
             batch = real_buffer.sample(CONFIG["BATCH_SIZE"])
             pred_r = reward_model(batch["states"], batch["actions"], batch["next_states"])
@@ -526,44 +485,43 @@ def train_agent(agent_type, horizon):
             for p in reward_model.parameters():
                 p.requires_grad = False
 
-            # --- Starting states sampled from REAL buffer ---
+            # --- CRITIC ROLLOUT ---
             curr = real_buffer.sample_states(B)
-            i_states, i_rewards, i_next = [], [], []
+            i_states, i_rewards, i_next, i_trust = [], [], [], []
 
             for t in range(H):
                 a = actor.sample(curr)
                 ns = agent.predict_next_state(curr, a)
                 r = reward_model(curr, a, ns).squeeze(-1)
+                
+                # Compute trust for safeguarding
+                w = trust_comp.compute_trust(ns).squeeze(-1)
 
                 i_states.append(curr)
                 i_rewards.append(r)
                 i_next.append(ns)
+                i_trust.append(w)
                 curr = ns
 
             rew_t = torch.stack(i_rewards, dim=1)
             ns_t = torch.stack(i_next, dim=1)
             st_t = torch.stack(i_states, dim=1)
+            tr_t = torch.stack(i_trust, dim=1)
 
-            # Critic targets (use min of twin targets to prevent overestimation)
             with torch.no_grad():
                 nv = critic_target.min_value(
                     ns_t.reshape(B * H, -1)
                 ).squeeze(-1).reshape(B, H)
+                nv = symexp(nv)
 
-                # Denormalize critic_target values before TD(λ) — critic now
-                # outputs in normalized space, but TD(λ) mixes with raw rewards
-                nv = ret_normalizer.denormalize(nv)
-
+                # Pass trust weights to correctly penalize the targets
                 targets = compute_lambda_returns(
-                    rew_t.detach(), nv,
+                    rew_t.detach(), nv, tr_t.detach(),
                     CONFIG["DISCOUNT"], CONFIG["LAMBDA"]
                 )
 
-            # Normalize targets — prevents loss scale from growing with value scale
-            ret_normalizer.update(targets)
-            targets_norm = ret_normalizer.normalize(targets)
+            targets_norm = symlog(targets)
 
-            # Train both critic heads against normalized targets
             v1, v2 = critic(st_t.reshape(B * H, -1).detach())
             v1 = v1.squeeze(-1).reshape(B, H)
             v2 = v2.squeeze(-1).reshape(B, H)
@@ -574,7 +532,7 @@ def train_agent(agent_type, horizon):
             torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
             critic_opt.step()
 
-            # --- ACTOR UPDATE (fresh rollout) ---
+            # --- ACTOR UPDATE ---
             for p in critic.parameters():
                 p.requires_grad = False
 
@@ -586,45 +544,46 @@ def train_agent(agent_type, horizon):
                 a = actor.sample(curr_a)
                 ns = agent.predict_next_state(curr_a, a)
                 r = reward_model(curr_a, a, ns).squeeze(-1)
+                
+                # Re-compute trust to cut off Actor's objective
+                w = trust_comp.compute_trust(ns).squeeze(-1)
 
-                # Entropy bonus
                 mu, log_std = actor(curr_a)
                 std = torch.exp(torch.clamp(log_std, -5, 0.5))
                 ent = 0.5 * torch.log(2 * np.pi * np.e * std.pow(2)).sum(dim=-1)
 
                 ret = ret + disc * (r + CONFIG["ENTROPY_COEFF"] * ent)
-                disc = disc * CONFIG["DISCOUNT"]
+                
+                # Penalty: discount is permanently zeroed if hallucination occurs
+                disc = disc * CONFIG["DISCOUNT"] * w
                 curr_a = ns
 
-            # Actor bootstrap: min(V1, V2) — denormalize since critic outputs normalized values
             v1_a, v2_a = critic(curr_a)
-            v_boot = ret_normalizer.denormalize(torch.min(v1_a, v2_a).squeeze(-1))
+            v_boot = symexp(torch.min(v1_a, v2_a).squeeze(-1))
             ret = ret + disc * v_boot
-            actor_loss = -ret.mean()
+            
+            actor_loss = -symlog(ret).mean()
 
             actor_opt.zero_grad()
             actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
             actor_opt.step()
 
-            # Unfreeze everything
             for p in critic.parameters():
                 p.requires_grad = True
             for p in reward_model.parameters():
                 p.requires_grad = True
             agent.unfreeze_after_rollout()
 
-            # Polyak
             with torch.no_grad():
                 for p, tp in zip(critic.parameters(), critic_target.parameters()):
                     tp.data.copy_(CONFIG["TAU"] * p.data + (1 - CONFIG["TAU"]) * tp.data)
 
-            # --- LOGGING ---
             if total_steps % CONFIG["LOG_INTERVAL"] == 0:
                 print(f"  [Step {total_steps}] Critic: {critic_loss.item():.4f} | "
                       f"Actor: {actor_loss.item():.4f}")
 
-        # ==== 5. PREDICTION DIAGNOSTIC (vs REAL data) ====
+        # ==== 5. PREDICTION DIAGNOSTIC ====
         if total_steps % CONFIG["DIAGNOSTIC_INTERVAL"] == 0:
             diag = evaluate_prediction_accuracy(agent, real_buffer)
             if diag:
@@ -646,7 +605,6 @@ def train_agent(agent_type, horizon):
         "diagnostic_log": diag_log,
     }
 
-
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -654,7 +612,7 @@ def main():
     print(f"\n{'#'*60}")
     print(f"PENDULUM-v1 MBRL POLICY CONVERGENCE")
     print(f"World models train on REAL data online (standard MBRL)")
-    print(f"Critic + Actor on imagined rollouts ONLY")
+    print(f"Critic + Actor on imagined rollouts ONLY (Z-Score Safeguard)")
     print(f"{'#'*60}\n")
 
     agent_types = ["EBM (Langevin)", "Flow", "MDN"]
@@ -713,7 +671,6 @@ def main():
 
     np.save("pendulum_results.npy", all_results, allow_pickle=True)
     print("Saved: pendulum_results.npy\nDone!")
-
 
 if __name__ == "__main__":
     main()
