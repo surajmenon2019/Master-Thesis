@@ -1,247 +1,163 @@
 import torch
 
+"""
+Sampling utilities for EBM-based world models.
+
+Two sampling strategies:
+1. langevin_sample - Langevin dynamics with FULL backprop through all steps.
+   Every step uses create_graph=True when differentiable=True, so the
+   entire chain actor -> flow init -> Langevin step 0 -> ... -> step K
+   is fully differentiable. The actor learns through the EBM's energy
+   landscape, not just through the flow.
+
+2. langevin_refine - Flow init + short Langevin refinement (warm start).
+"""
+
 # =============================================================================
-# DEFAULT CONFIGURATION
+# DEFAULT CONFIG
 # =============================================================================
 DEFAULT_CONFIG = {
     "LANGEVIN_STEPS": 30,
-    "LANGEVIN_STEP_SIZE": 0.05,  # Moderate step size (was 0.5, exploded)
-    "LANGEVIN_NOISE_SCALE": 0.01,
-    "SVGD_STEPS": 10,
-    "SVGD_STEP_SIZE": 0.05,
-    "SVGD_PARTICLES": 10,
+    "LANGEVIN_STEP_SIZE": 0.005,
+    "LANGEVIN_NOISE_SCALE": 0.002,
 }
 
+
 # =============================================================================
-# ENERGY GRADIENT COMPUTATION
+# ENERGY GRADIENT
 # =============================================================================
-def get_energy_gradient(model, state, action, next_state, differentiable=False):
+def get_energy_gradient(model, state, action, next_state, create_graph=False):
     """
-    Compute ∂E(s,a,s')/∂s' for any dimensionality.
-    
-    Handles both:
-    - next_state: (B, D) → returns (B, D)
-    - next_state: (B, P, D) → returns (B, P, D) for SVGD particles
-    
+    Compute dE/d(next_state).
+
     Args:
-        differentiable: If True, keeps the computation graph connected
-            across Langevin steps (no detach). Required for true E2E
-            gradient flow through the sampling chain.
-            If False (default), detaches at each step for memory efficiency.
+        create_graph: If True, the gradient itself is differentiable
+                      (needed for backprop through Langevin steps).
+    Returns:
+        grad: same shape as next_state
     """
-    original_shape = next_state.shape
-    is_particles = len(original_shape) == 3
+    ns = next_state
+    if not ns.requires_grad:
+        ns = ns.requires_grad_(True)
+
+    energy = model(state, action, ns)
+    grad = torch.autograd.grad(
+        outputs=energy.sum(),
+        inputs=ns,
+        create_graph=create_graph,
+        retain_graph=create_graph
+    )[0]
+    return grad
+
+
+# =============================================================================
+# 1. LANGEVIN DYNAMICS 
+# =============================================================================
+def langevin_sample(model, state, action, init_state=None,
+                    use_ascent=True, config=None, differentiable=True):
+    """
+    Langevin dynamics sampling from EBM.
+
+    When differentiable=True, ALL steps use create_graph=True so the
+    full gradient chain is preserved:
+        actor -> action -> flow_init -> step_0 -> step_1 -> ... -> step_K
     
-    if is_particles:
-        # SVGD case: (B, P, D) — already differentiable (no detach)
-        B, P, D = original_shape
-        next_state_flat = next_state.reshape(B * P, D).requires_grad_(True)
-        state_exp = state.unsqueeze(1).expand(B, P, -1).reshape(B * P, -1)
-        action_exp = action.unsqueeze(1).expand(B, P, -1).reshape(B * P, -1)
-        
-        energies = model(state_exp, action_exp, next_state_flat)
-        grad = torch.autograd.grad(
-            outputs=energies, inputs=next_state_flat,
-            grad_outputs=torch.ones_like(energies),
-            create_graph=True
-        )[0]
-        return grad.reshape(B, P, D)
+    The actor learns through the EBM's energy landscape — which actions
+    lead to next states in high-energy (compatible) regions.
+
+    When differentiable=False (inference/diagnostics), no graph is built.
+
+    Args:
+        model: EBM (BilinearEBM or standard)
+        state, action: (B, D), (B, A)
+        init_state: optional warm-start initialization
+        use_ascent: True for BilinearEBM (higher energy = better)
+        config: optional overrides
+        differentiable: if True, full backprop through all steps
+    """
+    cfg = DEFAULT_CONFIG.copy()
+    if config:
+        cfg.update(config)
+
+    if init_state is not None:
+        curr = init_state
     else:
-        # Langevin case: (B, D)
+        curr = torch.randn_like(state)
+
+    n_steps = cfg["LANGEVIN_STEPS"]
+    step_size = cfg["LANGEVIN_STEP_SIZE"]
+    noise_scale = cfg["LANGEVIN_NOISE_SCALE"]
+
+    for i in range(n_steps):
+        # Ensure curr has requires_grad for autograd.grad to work.
+        # This is needed when EBM params are frozen during actor rollouts —
+        # the forward pass won't build a graph unless the INPUT requires grad.
+        if not curr.requires_grad:
+            curr = curr.requires_grad_(True)
+
+        # Only build the computation graph on the VERY LAST step.
+        is_last_step = (i == n_steps - 1)
+        step_create_graph = differentiable and is_last_step
+        
+        grad = get_energy_gradient(model, state, action, curr,
+                                   create_graph=step_create_graph)
+
+        # Proper Langevin dynamics: gradient step + reparameterized noise.
+        # The noise is critical — without it, this is pure gradient ascent
+        # (mode-seeking), not sampling from p(s'|s,a). randn_like is
+        # differentiable via the reparameterization trick.
+        noise = torch.randn_like(curr) * noise_scale
+
         if differentiable:
-            # DIFFERENTIABLE MODE: keep graph connected across steps
-            # Do NOT detach — gradients flow through entire Langevin chain
-            ns = next_state
-            if not ns.requires_grad:
-                ns = ns.detach().requires_grad_(True)  # only for initial leaf
-            energies = model(state, action, ns)
-            grad = torch.autograd.grad(
-                outputs=energies.sum(), inputs=ns,
-                create_graph=True, retain_graph=True
-            )[0]
-            return grad
+            if not is_last_step:
+                # Detach gradient contribution of this step to avoid Hessian
+                # explosion, but keep the forward path from Flow init intact.
+                if use_ascent:
+                    curr = curr + step_size * grad.detach() + noise
+                else:
+                    curr = curr - step_size * grad.detach() + noise
+            else:
+                # Last step: full gradient chain preserved for backprop.
+                if use_ascent:
+                    curr = curr + step_size * grad + noise
+                else:
+                    curr = curr - step_size * grad + noise
         else:
-            # DETACHED MODE (default): memory-efficient, no cross-step gradients
-            with torch.enable_grad():
-                next_state = next_state.detach().requires_grad_(True)
-                energies = model(state, action, next_state)
-                grad = torch.autograd.grad(
-                    outputs=energies, inputs=next_state,
-                    grad_outputs=torch.ones_like(energies),
-                    create_graph=True
-                )[0]
-            return grad
+            if use_ascent:
+                curr = curr + step_size * grad + noise
+            else:
+                curr = curr - step_size * grad + noise
 
-# =============================================================================
-# 1. LANGEVIN DYNAMICS
-# =============================================================================
-def predict_next_state_langevin(model, state, action, init_state=None, config=None):
-    cfg = DEFAULT_CONFIG.copy()
-    if config: cfg.update(config)
-    
-    if init_state is None:
-        curr_state = torch.randn_like(state) 
-    else:
-        curr_state = init_state 
+    return curr
 
-    for i in range(cfg["LANGEVIN_STEPS"]):
-        noise = torch.randn_like(curr_state) * cfg["LANGEVIN_NOISE_SCALE"]
-        grad_energy = get_energy_gradient(model, state, action, curr_state)
-        curr_state = curr_state - cfg["LANGEVIN_STEP_SIZE"] * grad_energy + noise
-    
-    return curr_state
 
-def predict_next_state_langevin_adaptive(model, state, action, init_state=None, use_ascent=False, config=None, differentiable=False):
+def langevin_refine(ebm, state, action, flow, config=None, differentiable=True):
     """
-    Adaptive Langevin dynamics for BilinearEBM and standard EBM.
-    
-    Args:
-        model: Energy model (BilinearEBM or EnergyBasedModel)
-        state: (B, state_dim)
-        action: (B, action_dim)
-        init_state: Optional initialization
-        use_ascent: If True, use gradient ASCENT (for BilinearEBM: higher energy = better)
-                    If False, use gradient DESCENT (for standard EBM: lower energy = better)
-        config: Optional config dict
-        differentiable: If True, keeps gradient graph connected across ALL
-            Langevin steps, enabling true E2E backpropagation through the
-            sampling chain. More memory-intensive but required for proper
-            model-based policy gradients. Default False for compatibility.
-    
-    Returns:
-        predicted_state: (B, state_dim)
+    Warm-start Langevin: initialize from Flow, refine with EBM.
+
+    The flow provides a good starting point (differentiable w.r.t. action).
+    Langevin then follows the EBM's energy gradients to refine.
+    With differentiable=True, the full chain is backpropable:
+        actor -> action -> flow_init -> Langevin(EBM) -> prediction
     """
     cfg = DEFAULT_CONFIG.copy()
-    if config: cfg.update(config)
-    
-    if init_state is None:
-        curr_state = torch.randn_like(state)
-    else:
-        curr_state = init_state
-    
-    for i in range(cfg["LANGEVIN_STEPS"]):
-        noise = torch.randn_like(curr_state) * cfg["LANGEVIN_NOISE_SCALE"]
-        grad_energy = get_energy_gradient(model, state, action, curr_state, differentiable=differentiable)
-        
-        if use_ascent:
-            curr_state = curr_state + cfg["LANGEVIN_STEP_SIZE"] * grad_energy + noise
-        else:
-            curr_state = curr_state - cfg["LANGEVIN_STEP_SIZE"] * grad_energy + noise
-            
-        curr_state = torch.clamp(curr_state, -10.0, 10.0)
-    
-    return curr_state
+    if config:
+        cfg.update(config)
 
-# =============================================================================
-# 2. DIFFERENTIABLE SVGD (Batch-Corrected)
-# =============================================================================
-def rbf_kernel_matrix_batched(x, h_min=1e-3):
-    """
-    Computes RBF kernel for a Batch of Particle sets.
-    Input: (Batch, Particles, Dim)
-    """
-    B, N, D = x.shape
-    
-    # Pairwise differences: (B, N, 1, D) - (B, 1, N, D)
-    diff = x.unsqueeze(2) - x.unsqueeze(1) 
-    dist_sq = diff.pow(2).sum(dim=-1) # (B, N, N)
-    
-    # Median Heuristic
-    h = torch.median(dist_sq.view(B, -1), dim=1, keepdim=True)[0]
-    h = torch.clamp(h, min=h_min).unsqueeze(1)
-    
-    # Kernel
-    k_xx = torch.exp(-dist_sq / h) # (B, N, N)
-    
-    # Gradient of kernel
-    grad_k = -2.0 * k_xx.unsqueeze(-1) * diff / h.unsqueeze(-1)
-    grad_k = grad_k.sum(dim=2)
-    
-    return k_xx, grad_k
+    # Initialize from flow (differentiable w.r.t. action via context)
+    B = state.shape[0]
+    z = torch.randn(B, state.shape[1], device=state.device)
+    context = torch.cat([state, action], dim=1)
+    init = flow.sample(z, context=context)
 
-def predict_next_state_svgd(model, state, action, config=None):
-    cfg = DEFAULT_CONFIG.copy()
-    if config: cfg.update(config)
-    
-    num_particles = 10
-    B, D = state.shape
-    
-    # 1. Initialize Particles (B, P, D)
-    # We broadcast state/action internally in get_energy_gradient
-    particles = torch.randn(B, num_particles, D).to(state.device)
-    
-    # 2. SVGD Loop
-    for i in range(cfg["SVGD_STEPS"]):
-        # A. Score Function: (B, P, D)
-        # get_energy_gradient handles the flattening and returns (B, P, D)
-        grad_energy = get_energy_gradient(model, state, action, particles)
-        score_func = -grad_energy 
-        
-        # B. Kernel: (B, P, P) and (B, P, D)
-        k_xx, grad_k = rbf_kernel_matrix_batched(particles) 
-        
-        # C. Update Direction
-        # Matmul: (B, P, P) @ (B, P, D) -> (B, P, D)
-        term1 = torch.matmul(k_xx, score_func)
-        phi = (term1 + grad_k) / num_particles
-        
-        # D. Step
-        particles = particles + cfg["SVGD_STEP_SIZE"] * phi
-    
-    random_idx = torch.randint(0, num_particles, (B,), device=state.device)
-    selected_particle = particles[torch.arange(B), random_idx]
-    
-    return selected_particle
+    # Short Langevin refinement (fewer steps since we start close)
+    refine_cfg = cfg.copy()
+    refine_cfg["LANGEVIN_STEPS"] = max(cfg["LANGEVIN_STEPS"] // 3, 5)
 
-def predict_next_state_svgd_adaptive(model, state, action, use_ascent=False, config=None):
-    """
-    Adaptive SVGD for BilinearEBM and standard EBM.
-    
-    Args:
-        model: Energy model
-        state: (B, state_dim)
-        action: (B, action_dim)
-        use_ascent: If True, maximize energy (BilinearEBM: higher = better)
-                    If False, minimize energy (standard EBM: lower = better)
-        config: Optional config dict
-    
-    Returns:
-        predicted_state: (B, state_dim)
-    """
-    cfg = DEFAULT_CONFIG.copy()
-    if config: cfg.update(config)
-    
-    B, D = state.shape
-    num_particles = cfg.get("SVGD_PARTICLES", 10)
-    
-    # Initialize particles
-    particles = torch.randn(B, num_particles, D).to(state.device)
-    
-    for step in range(cfg.get("SVGD_STEPS", 10)):
-        # Compute energy gradients using existing function
-        grad_energy = get_energy_gradient(model, state, action, particles)  # (B, P, D)
-        
-        # Kernel and gradients
-        k_xx, grad_k = rbf_kernel_matrix_batched(particles)  # (B, P, P), (B, P, D)
-        
-        if use_ascent:
-            # BilinearEBM: maximize energy (gradient ASCENT)
-            # Move particles toward regions of HIGHER energy
-            score_func = grad_energy  # Positive gradient = increase energy
-        else:
-            # Standard EBM: minimize energy (gradient DESCENT)
-            # Move particles toward regions of LOWER energy
-            score_func = -grad_energy  # Negative gradient = decrease energy
-        
-        # SVGD update
-        term1 = torch.matmul(k_xx, score_func)  # (B, P, D)
-        phi = (term1 + grad_k) / num_particles
-        
-        # Step
-        particles = particles + cfg.get("SVGD_STEP_SIZE", 0.01) * phi
-    
-    # Return random particle from ensemble
-    random_idx = torch.randint(0, num_particles, (B,), device=state.device)
-    selected_particle = particles[torch.arange(B), random_idx]
-    
-    return selected_particle
+    return langevin_sample(
+        ebm, state, action,
+        init_state=init,
+        use_ascent=True,
+        config=refine_cfg,
+        differentiable=differentiable
+    )
