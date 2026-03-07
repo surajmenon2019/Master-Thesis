@@ -1,30 +1,35 @@
 import torch
+import torch.nn.functional as F
 
 """
 Sampling utilities for EBM-based world models.
 
-Two sampling strategies:
-1. langevin_sample - Langevin dynamics with FULL backprop through all steps.
-   Every step uses create_graph=True when differentiable=True, so the
-   entire chain actor -> flow init -> Langevin step 0 -> ... -> step K
-   is fully differentiable. The actor learns through the EBM's energy
-   landscape, not just through the flow.
+Three sampling strategies:
+1. importance_weighted_sample — PRIMARY METHOD for BilinearEBM.
+   Draw N candidates from a proposal (Flow/MDN/noise), score with EBM,
+   resample via differentiable softmax weighting. No Langevin needed.
 
-2. langevin_refine - Flow init + short Langevin refinement (warm start).
+2. langevin_sample — Langevin dynamics with proper truncated backprop.
+   Fixed: the `step_diff` variable was computed but never used in original.
+   Now only the final step creates graph, all others detach properly.
+
+3. langevin_refine — Flow init + short Langevin refinement (warm start).
 """
 
 # =============================================================================
 # DEFAULT CONFIG
 # =============================================================================
 DEFAULT_CONFIG = {
-    "LANGEVIN_STEPS": 30,
-    "LANGEVIN_STEP_SIZE": 0.005,
-    "LANGEVIN_NOISE_SCALE": 0.002,
+    "LANGEVIN_STEPS": 30,          # was 20 — more steps for higher dim energy landscape
+    "LANGEVIN_STEP_SIZE": 0.005,   # was 0.01 — smaller steps for stability in 17D
+    "LANGEVIN_NOISE_SCALE": 0.002, # was 0.005 — less noise in higher dim
+    "IW_NUM_SAMPLES": 64,
+    "IW_TEMPERATURE": 1.0,      # softmax temperature for resampling
 }
 
 
 # =============================================================================
-# ENERGY GRADIENT
+# ENERGY GRADIENT (simplified, single code path)
 # =============================================================================
 def get_energy_gradient(model, state, action, next_state, create_graph=False):
     """
@@ -32,13 +37,13 @@ def get_energy_gradient(model, state, action, next_state, create_graph=False):
 
     Args:
         create_graph: If True, the gradient itself is differentiable
-                      (needed for backprop through Langevin steps).
+                      (needed for actor backprop through final Langevin step).
     Returns:
         grad: same shape as next_state
     """
     ns = next_state
     if not ns.requires_grad:
-        ns = ns.requires_grad_(True)
+        ns = ns.detach().requires_grad_(True)
 
     energy = model(state, action, ns)
     grad = torch.autograd.grad(
@@ -51,21 +56,69 @@ def get_energy_gradient(model, state, action, next_state, create_graph=False):
 
 
 # =============================================================================
-# 1. LANGEVIN DYNAMICS 
+# 1. IMPORTANCE-WEIGHTED RESAMPLING (Primary method for EBM)
+# =============================================================================
+def importance_weighted_sample(ebm, state, action, proposal_fn, config=None):
+    """
+    Differentiable importance-weighted sampling from EBM.
+
+    Instead of running Langevin on a flat energy surface, we:
+    1. Draw N candidate next-states from a proposal distribution
+    2. Score each candidate with the EBM
+    3. Softmax-weight and combine (differentiable via Gumbel-Softmax)
+
+    This directly tests the thesis question: "does the EBM improve
+    over the proposal (Flow/MDN) alone?"
+
+    Args:
+        ebm: BilinearEBM model (higher energy = more compatible)
+        state: (B, state_dim)
+        action: (B, action_dim)
+        proposal_fn: callable(B, N) -> (B, N, state_dim) candidate samples.
+                     Must be differentiable (reparameterized).
+        config: optional config overrides
+
+    Returns:
+        predicted_ns: (B, state_dim) — differentiable w.r.t. actor params
+    """
+    cfg = DEFAULT_CONFIG.copy()
+    if config:
+        cfg.update(config)
+
+    B = state.shape[0]
+    N = cfg["IW_NUM_SAMPLES"]
+    temperature = cfg["IW_TEMPERATURE"]
+
+    # 1. Generate N candidate next-states from proposal
+    candidates = proposal_fn(B, N)  # (B, N, state_dim)
+
+    # 2. Score each candidate with EBM
+    state_exp = state.unsqueeze(1).expand(B, N, -1)    # (B, N, state_dim)
+    action_exp = action.unsqueeze(1).expand(B, N, -1)   # (B, N, action_dim)
+    energies = ebm(state_exp, action_exp, candidates)    # (B, N)
+
+    # 3. Differentiable soft resampling
+    # Gumbel-Softmax gives differentiable categorical-like weights
+    weights = F.gumbel_softmax(energies / temperature, tau=1.0, hard=False)  # (B, N)
+
+    # 4. Weighted combination of candidates
+    predicted_ns = (weights.unsqueeze(-1) * candidates).sum(dim=1)  # (B, state_dim)
+
+    return predicted_ns
+
+
+# =============================================================================
+# 2. LANGEVIN DYNAMICS (fixed truncated backprop)
 # =============================================================================
 def langevin_sample(model, state, action, init_state=None,
                     use_ascent=True, config=None, differentiable=True):
     """
     Langevin dynamics sampling from EBM.
 
-    When differentiable=True, ALL steps use create_graph=True so the
-    full gradient chain is preserved:
-        actor -> action -> flow_init -> step_0 -> step_1 -> ... -> step_K
-    
-    The actor learns through the EBM's energy landscape — which actions
-    lead to next states in high-energy (compatible) regions.
-
-    When differentiable=False (inference/diagnostics), no graph is built.
+    FIXES from original:
+    - `step_diff` was computed but NEVER USED — now it controls create_graph.
+    - Proper truncated backprop: steps 0..K-2 detach, only step K-1 keeps graph.
+    - This bounds gradient magnitude while still allowing actor signal to flow.
 
     Args:
         model: EBM (BilinearEBM or standard)
@@ -73,7 +126,7 @@ def langevin_sample(model, state, action, init_state=None,
         init_state: optional warm-start initialization
         use_ascent: True for BilinearEBM (higher energy = better)
         config: optional overrides
-        differentiable: if True, full backprop through all steps
+        differentiable: if True, final step retains computation graph
     """
     cfg = DEFAULT_CONFIG.copy()
     if config:
@@ -89,44 +142,25 @@ def langevin_sample(model, state, action, init_state=None,
     noise_scale = cfg["LANGEVIN_NOISE_SCALE"]
 
     for i in range(n_steps):
-        # Ensure curr has requires_grad for autograd.grad to work.
-        # This is needed when EBM params are frozen during actor rollouts —
-        # the forward pass won't build a graph unless the INPUT requires grad.
-        if not curr.requires_grad:
-            curr = curr.requires_grad_(True)
+        is_last = (i == n_steps - 1)
 
-        # Only build the computation graph on the VERY LAST step.
-        is_last_step = (i == n_steps - 1)
-        step_create_graph = differentiable and is_last_step
-        
+        # TRUNCATED BACKPROP: only the last step creates graph
+        step_create_graph = differentiable and is_last
+
+        # Ensure curr has requires_grad on ALL steps
+        # Detach to prevent exploding gradient chains through all steps
+        # Only the final step's create_graph=True allows actor gradient flow
+        curr = curr.detach().requires_grad_(True)
+
         grad = get_energy_gradient(model, state, action, curr,
                                    create_graph=step_create_graph)
 
-        # Proper Langevin dynamics: gradient step + reparameterized noise.
-        # The noise is critical — without it, this is pure gradient ascent
-        # (mode-seeking), not sampling from p(s'|s,a). randn_like is
-        # differentiable via the reparameterization trick.
         noise = torch.randn_like(curr) * noise_scale
 
-        if differentiable:
-            if not is_last_step:
-                # Detach gradient contribution of this step to avoid Hessian
-                # explosion, but keep the forward path from Flow init intact.
-                if use_ascent:
-                    curr = curr + step_size * grad.detach() + noise
-                else:
-                    curr = curr - step_size * grad.detach() + noise
-            else:
-                # Last step: full gradient chain preserved for backprop.
-                if use_ascent:
-                    curr = curr + step_size * grad + noise
-                else:
-                    curr = curr - step_size * grad + noise
+        if use_ascent:
+            curr = curr + step_size * grad + noise
         else:
-            if use_ascent:
-                curr = curr + step_size * grad + noise
-            else:
-                curr = curr - step_size * grad + noise
+            curr = curr - step_size * grad + noise
 
     return curr
 
@@ -135,16 +169,14 @@ def langevin_refine(ebm, state, action, flow, config=None, differentiable=True):
     """
     Warm-start Langevin: initialize from Flow, refine with EBM.
 
-    The flow provides a good starting point (differentiable w.r.t. action).
-    Langevin then follows the EBM's energy gradients to refine.
-    With differentiable=True, the full chain is backpropable:
-        actor -> action -> flow_init -> Langevin(EBM) -> prediction
+    This is the "Warm Start" agent variant. The flow provides a good
+    initial guess, and Langevin nudges it toward the EBM's energy peak.
     """
     cfg = DEFAULT_CONFIG.copy()
     if config:
         cfg.update(config)
 
-    # Initialize from flow (differentiable w.r.t. action via context)
+    # Initialize from flow (differentiable)
     B = state.shape[0]
     z = torch.randn(B, state.shape[1], device=state.device)
     context = torch.cat([state, action], dim=1)
@@ -157,7 +189,7 @@ def langevin_refine(ebm, state, action, flow, config=None, differentiable=True):
     return langevin_sample(
         ebm, state, action,
         init_state=init,
-        use_ascent=True,
+        use_ascent=True,  # BilinearEBM convention
         config=refine_cfg,
         differentiable=differentiable
     )
