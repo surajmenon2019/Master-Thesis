@@ -20,19 +20,22 @@ THESIS EXPERIMENT:
 Agents:
   1. EBM (IW)        — Flow proposal + EBM importance-weighted resampling
   2. EBM (Langevin)  — Flow init + EBM Langevin refinement
-  3. Flow            — RealNVP direct sampling
-  4. MDN             — Mixture Density Network direct sampling
+  3. EBM (SVGD)      — Flow init + EBM SVGD refinement (mode-covering particles)
+  4. Flow            — RealNVP direct sampling
+  5. MDN             — Mixture Density Network direct sampling
 
 Outputs:
   1. pendulum_convergence.png  — eval reward vs steps, per horizon
   2. pendulum_trust.png        — rollout trust %, per horizon
   3. pendulum_mse.png          — 1-step prediction MSE over training
+  4. pendulum_compute.png      — computational cost breakdown per agent
 """
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
 import gymnasium as gym
+import time
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -42,7 +45,7 @@ from models import (
     Actor, ValueNetwork, BilinearEBM, RealNVP,
     MixtureDensityNetwork, RewardModel
 )
-from utils_sampling import importance_weighted_sample, langevin_refine
+from utils_sampling import importance_weighted_sample, langevin_refine, svgd_sample
 
 # =============================================================================
 # CONFIGURATION
@@ -77,6 +80,12 @@ CONFIG = {
     "LANGEVIN_STEPS": 15,
     "LANGEVIN_STEP_SIZE": 0.01,
     "LANGEVIN_NOISE_SCALE": 0.005,
+
+    # SVGD
+    "SVGD_NUM_PARTICLES": 32,
+    "SVGD_STEPS": 15,
+    "SVGD_STEP_SIZE": 0.01,
+    "SVGD_BANDWIDTH": None,       # None = median heuristic
 
     # InfoNCE (EBM online update)
     "NUM_NEGATIVES": 256,
@@ -261,7 +270,17 @@ class WorldModelAgent:
         hd = CONFIG["HIDDEN_DIM"]
         lr = CONFIG["LR_WORLD_MODEL"]
 
-        if "EBM" in agent_type:
+        if agent_type == "EBM (SVGD)":
+            # SVGD: EBM only, no Flow — pure particle-based sampling
+            self.ebm = BilinearEBM(state_dim, action_dim, hidden_dim=hd).to(device)
+            self.ebm.load_state_dict(torch.load(
+                "pretrained_ebm_pendulum.pth", map_location=device, weights_only=True))
+
+            self.wm_optimizer = optim.Adam(self.ebm.parameters(), lr=lr)
+            self._needs_ebm_grad = True
+
+        elif "EBM" in agent_type:
+            # EBM (IW) and EBM (Langevin): need both EBM and Flow
             self.ebm = BilinearEBM(state_dim, action_dim, hidden_dim=hd).to(device)
             self.ebm.load_state_dict(torch.load(
                 "pretrained_ebm_pendulum.pth", map_location=device, weights_only=True))
@@ -270,11 +289,13 @@ class WorldModelAgent:
             self.flow.load_state_dict(torch.load(
                 "pretrained_flow_pendulum.pth", map_location=device, weights_only=True))
 
-            # Both EBM and Flow get updated for EBM agents
-            # EBM adapts its energy landscape, Flow adapts its proposal
+            # Both EBM and Flow get updated for these agents
             self.wm_optimizer = optim.Adam(
                 list(self.ebm.parameters()) + list(self.flow.parameters()), lr=lr
             )
+
+            # Langevin needs autograd.grad through EBM
+            self._needs_ebm_grad = (agent_type == "EBM (Langevin)")
 
         elif agent_type == "Flow":
             self.flow = RealNVP(state_dim, context_dim=state_dim + action_dim, hidden_dim=hd).to(device)
@@ -373,13 +394,13 @@ class WorldModelAgent:
     def freeze_for_rollout(self):
         """
         Temporarily freeze world model params so actor grads don't corrupt them.
-        FIX: EBM (Langevin) keeps EBM unfrozen — Langevin needs autograd.grad
-        through the energy function to compute dE/ds'.
+        FIX: EBM (Langevin) and EBM (SVGD) keep EBM unfrozen — both need
+        autograd.grad through the energy function to compute dE/ds'.
         """
         if self.ebm is not None:
-            if self.agent_type != "EBM (Langevin)":
+            if not getattr(self, '_needs_ebm_grad', False):
                 for p in self.ebm.parameters(): p.requires_grad = False
-            # For Langevin: EBM stays unfrozen (autograd needs live graph)
+            # For Langevin/SVGD: EBM stays unfrozen (autograd needs live graph)
         if self.flow is not None:
             for p in self.flow.parameters(): p.requires_grad = False
         if self.mdn is not None:
@@ -426,6 +447,18 @@ class WorldModelAgent:
                     "LANGEVIN_STEPS": CONFIG["LANGEVIN_STEPS"],
                     "LANGEVIN_STEP_SIZE": CONFIG["LANGEVIN_STEP_SIZE"],
                     "LANGEVIN_NOISE_SCALE": CONFIG["LANGEVIN_NOISE_SCALE"],
+                },
+                differentiable=True,
+            )
+
+        elif self.agent_type == "EBM (SVGD)":
+            return svgd_sample(
+                self.ebm, state, action,
+                config={
+                    "SVGD_NUM_PARTICLES": CONFIG["SVGD_NUM_PARTICLES"],
+                    "SVGD_STEPS": CONFIG["SVGD_STEPS"],
+                    "SVGD_STEP_SIZE": CONFIG["SVGD_STEP_SIZE"],
+                    "SVGD_BANDWIDTH": CONFIG["SVGD_BANDWIDTH"],
                 },
                 differentiable=True,
             )
@@ -512,6 +545,18 @@ def train_agent(agent_type, horizon):
     eval_steps, eval_rewards = [], []
     diag_log, trust_log = [], []
 
+    # --- Timing ---
+    timing = {
+        "wm_update": [],         # world model online update
+        "reward_update": [],     # reward model update
+        "rollout_predict": [],   # predict_next_state calls during imagined rollout
+        "critic_update": [],     # critic loss + backward + step
+        "actor_update": [],      # actor rollout + loss + backward + step
+        "eval": [],              # evaluation episodes
+        "wall_clock": [],        # cumulative wall time at each LOG_INTERVAL
+    }
+    train_start_time = time.time()
+
     state, _ = env.reset()
     total_steps = 0
 
@@ -528,7 +573,9 @@ def train_agent(agent_type, horizon):
 
         # ==== 2. WORLD MODEL ONLINE UPDATE (fair: same schedule for all) ====
         if total_steps % CONFIG["WM_UPDATE_EVERY"] == 0:
+            _t0 = time.time()
             wm_metrics = agent.update_world_model(buffer)
+            timing["wm_update"].append(time.time() - _t0)
             if total_steps % CONFIG["LOG_INTERVAL"] == 0 and wm_metrics:
                 parts = []
                 for k, v in wm_metrics.items():
@@ -537,12 +584,14 @@ def train_agent(agent_type, horizon):
 
         # ==== 3. REWARD MODEL UPDATE (real data, every 5 steps) ====
         if buffer.size >= CONFIG["BATCH_SIZE"] and total_steps % 5 == 0:
+            _t0 = time.time()
             batch = buffer.sample(CONFIG["BATCH_SIZE"])
             pred_r = reward_model(batch["states"], batch["actions"], batch["next_states"])
             r_loss = F.mse_loss(pred_r, batch["rewards"])
             reward_opt.zero_grad()
             r_loss.backward()
             reward_opt.step()
+            timing["reward_update"].append(time.time() - _t0)
 
         # ==== 4. IMAGINED ROLLOUT + CRITIC + ACTOR (every 5 steps) ====
         if buffer.size >= CONFIG["BATCH_SIZE"] and total_steps % 5 == 0:
@@ -560,9 +609,12 @@ def train_agent(agent_type, horizon):
             curr = buffer.sample_states(B)
             i_states, i_rewards, i_next, i_trust = [], [], [], []
 
+            _t_predict = 0.0
             for t in range(H):
                 a = actor.sample(curr)
+                _tp0 = time.time()
                 ns = agent.predict_next_state(curr, a)
+                _t_predict += time.time() - _tp0
                 r = reward_model(curr, a, ns).squeeze(-1)   # (B,)
                 r = r.clamp(CONFIG["REWARD_CLAMP_MIN"], CONFIG["REWARD_CLAMP_MAX"])
                 w = trust_comp.compute_trust(ns)             # (B, 1)
@@ -579,6 +631,7 @@ def train_agent(agent_type, horizon):
             tr_t = torch.cat(i_trust, dim=1)                # (B, H)
 
             # Critic targets (imagined data ONLY)
+            _t0 = time.time()
             with torch.no_grad():
                 nv = critic_target(
                     ns_t.reshape(B * H, -1)
@@ -598,8 +651,10 @@ def train_agent(agent_type, horizon):
             critic_loss.backward()
             torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
             critic_opt.step()
+            timing["critic_update"].append(time.time() - _t0)
 
             # --- ACTOR UPDATE (fresh rollout for proper gradient flow) ---
+            _t0 = time.time()
             for p in critic.parameters():
                 p.requires_grad = False
 
@@ -609,7 +664,9 @@ def train_agent(agent_type, horizon):
 
             for t in range(H):
                 a = actor.sample(curr_a)
+                _tp0 = time.time()
                 ns = agent.predict_next_state(curr_a, a)
+                _t_predict += time.time() - _tp0
                 r = reward_model(curr_a, a, ns).squeeze(-1)  # (B,)
                 r = r.clamp(CONFIG["REWARD_CLAMP_MIN"], CONFIG["REWARD_CLAMP_MAX"])
                 w = trust_comp.compute_trust(ns).squeeze(-1)  # (B,)
@@ -631,6 +688,10 @@ def train_agent(agent_type, horizon):
             actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
             actor_opt.step()
+            timing["actor_update"].append(time.time() - _t0)
+
+            # Record total predict_next_state time (critic rollout + actor rollout)
+            timing["rollout_predict"].append(_t_predict)
 
             # Unfreeze everything
             for p in critic.parameters():
@@ -648,6 +709,10 @@ def train_agent(agent_type, horizon):
             if total_steps % CONFIG["LOG_INTERVAL"] == 0:
                 ts = trust_comp.compute_rollout_stats(i_trust)
                 trust_log.append({"step": total_steps, **ts})
+                timing["wall_clock"].append({
+                    "step": total_steps,
+                    "elapsed": time.time() - train_start_time,
+                })
                 bystep = " ".join(f"{v:.2f}" for v in ts["trust_by_step"])
                 print(f"  [Step {total_steps}] Critic: {critic_loss.item():.4f} | "
                       f"Actor: {actor_loss.item():.4f} | "
@@ -663,18 +728,35 @@ def train_agent(agent_type, horizon):
 
         # ==== 6. EVAL ====
         if total_steps % CONFIG["EVAL_INTERVAL"] == 0:
+            _t0 = time.time()
             em, es = evaluate_policy(actor, CONFIG["EVAL_EPISODES"])
+            timing["eval"].append(time.time() - _t0)
             eval_steps.append(total_steps)
             eval_rewards.append(em)
             print(f"Step {total_steps}/{CONFIG['TOTAL_STEPS']} | "
                   f"Eval: {em:.1f} +/- {es:.1f}")
 
     env.close()
+    total_wall = time.time() - train_start_time
+    print(f"\n  [{agent_type} H={horizon}] Total wall time: {total_wall:.1f}s")
+
+    # Summarize timing
+    def _mean(lst): return np.mean(lst) if lst else 0.0
+    def _sum(lst): return np.sum(lst) if lst else 0.0
+    print(f"    predict_next_state: {_sum(timing['rollout_predict']):.1f}s total "
+          f"({_mean(timing['rollout_predict'])*1000:.2f}ms avg/call)")
+    print(f"    wm_update:         {_sum(timing['wm_update']):.1f}s total "
+          f"({_mean(timing['wm_update'])*1000:.2f}ms avg/call)")
+    print(f"    critic_update:     {_sum(timing['critic_update']):.1f}s total")
+    print(f"    actor_update:      {_sum(timing['actor_update']):.1f}s total")
+
     return {
         "eval_steps": eval_steps,
         "eval_rewards": eval_rewards,
         "diagnostic_log": diag_log,
         "rollout_quality_log": trust_log,
+        "timing": timing,
+        "total_wall_time": total_wall,
     }
 
 
@@ -688,7 +770,7 @@ def main():
     print(f"Critic on imagined data ONLY")
     print(f"{'#'*60}\n")
 
-    agent_types = ["EBM (IW)", "EBM (Langevin)", "Flow", "MDN"]
+    agent_types = ["EBM (IW)", "EBM (Langevin)", "EBM (SVGD)", "Flow", "MDN"]
     horizons = [1, 3, 5]
 
     all_results = {}
@@ -703,7 +785,7 @@ def main():
 
     # ===== PLOT 1: Policy convergence =====
     colors = {"EBM (IW)": "tab:red", "EBM (Langevin)": "tab:orange",
-              "Flow": "tab:blue", "MDN": "tab:green"}
+              "EBM (SVGD)": "tab:purple", "Flow": "tab:blue", "MDN": "tab:green"}
 
     fig, axes = plt.subplots(1, len(horizons), figsize=(6*len(horizons), 5), sharey=True)
     if len(horizons) == 1: axes = [axes]
@@ -760,6 +842,137 @@ def main():
     plt.tight_layout()
     plt.savefig("pendulum_mse.png", dpi=200, bbox_inches="tight")
     print("Saved: pendulum_mse.png")
+
+    # ===== PLOT 4: Computational cost =====
+    # Two subplots:
+    #   Left:  Total wall-clock time per agent (stacked bar by component)
+    #   Right: Per-step predict_next_state cost (the key differentiator)
+
+    fig4, (ax4a, ax4b) = plt.subplots(1, 2, figsize=(14, 6))
+
+    # Collect timing data at H=3 (middle horizon) for clearest comparison
+    # Fall back to whatever horizon has data
+    timing_horizon = 3 if 3 in horizons else horizons[0]
+
+    bar_agents = []
+    bar_wall = []
+    bar_predict = []
+    bar_critic = []
+    bar_actor = []
+    bar_wm = []
+    bar_other = []
+    per_step_predict_mean = []
+    per_step_predict_std = []
+
+    for at in agent_types:
+        k = f"{at} H={timing_horizon}"
+        if k not in all_results or "timing" not in all_results[k]:
+            continue
+        t = all_results[k]["timing"]
+        total_w = all_results[k].get("total_wall_time", 0)
+
+        t_predict = np.sum(t["rollout_predict"]) if t["rollout_predict"] else 0
+        t_critic = np.sum(t["critic_update"]) if t["critic_update"] else 0
+        t_actor = np.sum(t["actor_update"]) if t["actor_update"] else 0
+        t_wm = np.sum(t["wm_update"]) if t["wm_update"] else 0
+        t_other = max(total_w - t_predict - t_critic - t_actor - t_wm, 0)
+
+        bar_agents.append(at)
+        bar_wall.append(total_w)
+        bar_predict.append(t_predict)
+        bar_critic.append(t_critic)
+        bar_actor.append(t_actor)
+        bar_wm.append(t_wm)
+        bar_other.append(t_other)
+
+        if t["rollout_predict"]:
+            per_step_predict_mean.append(np.mean(t["rollout_predict"]) * 1000)
+            per_step_predict_std.append(np.std(t["rollout_predict"]) * 1000)
+        else:
+            per_step_predict_mean.append(0)
+            per_step_predict_std.append(0)
+
+    if bar_agents:
+        x = np.arange(len(bar_agents))
+        width = 0.6
+
+        # Left: stacked bar chart of time breakdown
+        b1 = ax4a.bar(x, bar_predict, width, label="predict_next_state",
+                       color="tab:red", alpha=0.85)
+        b2 = ax4a.bar(x, bar_actor, width, bottom=np.array(bar_predict),
+                       label="actor update", color="tab:orange", alpha=0.85)
+        b3 = ax4a.bar(x, bar_critic, width,
+                       bottom=np.array(bar_predict) + np.array(bar_actor),
+                       label="critic update", color="tab:blue", alpha=0.85)
+        b4 = ax4a.bar(x, bar_wm, width,
+                       bottom=np.array(bar_predict) + np.array(bar_actor) + np.array(bar_critic),
+                       label="WM update", color="tab:green", alpha=0.85)
+        b5 = ax4a.bar(x, bar_other, width,
+                       bottom=(np.array(bar_predict) + np.array(bar_actor) +
+                               np.array(bar_critic) + np.array(bar_wm)),
+                       label="other (env, eval, etc)", color="tab:gray", alpha=0.5)
+
+        ax4a.set_xticks(x)
+        ax4a.set_xticklabels(bar_agents, rotation=20, ha="right", fontsize=9)
+        ax4a.set_ylabel("Time (seconds)")
+        ax4a.set_title(f"Total Wall-Clock Breakdown (H={timing_horizon})",
+                        fontsize=12, fontweight="bold")
+        ax4a.legend(fontsize=8, loc="upper left")
+        ax4a.grid(True, alpha=0.3, axis="y")
+
+        # Add total time labels on top
+        for i, tw in enumerate(bar_wall):
+            ax4a.text(i, tw + 0.5, f"{tw:.0f}s", ha="center", fontsize=9, fontweight="bold")
+
+        # Right: per-call predict_next_state cost (bar + error bar)
+        bar_colors = [colors.get(at, "tab:gray") for at in bar_agents]
+        ax4b.bar(x, per_step_predict_mean, width, yerr=per_step_predict_std,
+                  color=bar_colors, alpha=0.85, capsize=4)
+        ax4b.set_xticks(x)
+        ax4b.set_xticklabels(bar_agents, rotation=20, ha="right", fontsize=9)
+        ax4b.set_ylabel("Time (ms)")
+        ax4b.set_title(f"Per-Call predict_next_state Cost (H={timing_horizon})",
+                        fontsize=12, fontweight="bold")
+        ax4b.grid(True, alpha=0.3, axis="y")
+
+        # Add value labels
+        for i, (m, s) in enumerate(zip(per_step_predict_mean, per_step_predict_std)):
+            ax4b.text(i, m + s + 0.2, f"{m:.1f}ms", ha="center", fontsize=9, fontweight="bold")
+
+    plt.suptitle("Computational Cost Comparison", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig("pendulum_compute.png", dpi=200, bbox_inches="tight")
+    print("Saved: pendulum_compute.png")
+
+    # ===== PLOT 5: Wall-clock convergence (reward vs time, not steps) =====
+    fig5, ax5 = plt.subplots(figsize=(8, 5))
+    ax5.set_title(f"Reward vs Wall-Clock Time (H={timing_horizon})",
+                   fontsize=12, fontweight="bold")
+    ax5.set_xlabel("Wall Time (seconds)")
+    ax5.set_ylabel("Eval Reward")
+    ax5.grid(True, alpha=0.3)
+
+    for at in agent_types:
+        k = f"{at} H={timing_horizon}"
+        if k not in all_results or "timing" not in all_results[k]:
+            continue
+        d = all_results[k]
+        wc = d["timing"]["wall_clock"]
+        if not wc or not d["eval_steps"]:
+            continue
+
+        # Interpolate wall time at eval steps
+        wc_steps = [w["step"] for w in wc]
+        wc_times = [w["elapsed"] for w in wc]
+        if len(wc_steps) >= 2:
+            eval_times = np.interp(d["eval_steps"], wc_steps, wc_times)
+            ax5.plot(eval_times, d["eval_rewards"],
+                     label=at, color=colors[at], linewidth=2)
+
+    ax5.legend(fontsize=10)
+    plt.tight_layout()
+    plt.savefig("pendulum_wallclock.png", dpi=200, bbox_inches="tight")
+    print("Saved: pendulum_wallclock.png")
 
     np.save("pendulum_results.npy", all_results, allow_pickle=True)
     print("Saved: pendulum_results.npy\nDone!")

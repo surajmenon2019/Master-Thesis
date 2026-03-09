@@ -103,16 +103,6 @@ class BilinearEBM(nn.Module):
     ENERGY CONVENTION: Higher energy = more compatible (s,a) <-> s'.
     E(s,a,s') = g(s,a)^T W h(s')
 
-    KEY FIX vs original:
-    - REMOVED F.normalize. Normalization collapses the energy surface to
-      cosine similarity in [-1, +1], making gradients vanishingly small
-      for Langevin sampling. Without normalization, the energy landscape
-      has meaningful curvature that Langevin/SVGD can follow.
-    - Added spectral normalization to prevent energy explosion during
-      InfoNCE training (controls Lipschitz constant instead of clamping
-      the output range).
-    - Added a learned bilinear interaction matrix W for richer coupling
-      (instead of raw dot product which is rank-1 in gradient space).
     """
     def __init__(self, state_dim, action_dim, hidden_dim=128):
         super().__init__()
@@ -332,10 +322,6 @@ class MixtureDensityNetwork(nn.Module):
 class RewardModel(nn.Module):
     """
     Transition reward model r(s, a, s').
-
-    For Pendulum: reward depends on angle (in s) and torque (in a) and
-    angular velocity (in s), so r(s,a) would suffice. But r(s,a,s') is
-    more general and works for any env. No downside to over-conditioning.
     """
     def __init__(self, state_dim, action_dim, hidden_dim=256):
         super().__init__()
