@@ -63,7 +63,6 @@ CONFIG = {
 
     "LR_ACTOR": 3e-4,
     "LR_CRITIC": 3e-4,
-    "LR_REWARD": 1e-3,
     "LR_WORLD_MODEL": 1e-4,    # Same LR for ALL world model online updates
 
     "ENTROPY_COEFF": 0.01,
@@ -94,12 +93,6 @@ CONFIG = {
     # Trust weighting
     "TRUST_THRESHOLD": 3.0,
     "TRUST_SHARPNESS": 2.0,
-
-    # Reward model exploitation guard
-    # Clamp predicted rewards to env's true range during imagined rollouts
-    # Prevents actor from chasing reward model extrapolation artifacts
-    "REWARD_CLAMP_MIN": -16.28,  # Pendulum: -(pi^2 + 0.1*8^2 + 0.001*2^2)
-    "REWARD_CLAMP_MAX": 0.0,     # Pendulum: best possible reward
 
     # Logging
     "EVAL_INTERVAL": 1000,
@@ -280,7 +273,6 @@ class WorldModelAgent:
             self._needs_ebm_grad = True
 
         elif "EBM" in agent_type:
-            # EBM (IW) and EBM (Langevin): need both EBM and Flow
             self.ebm = BilinearEBM(state_dim, action_dim, hidden_dim=hd).to(device)
             self.ebm.load_state_dict(torch.load(
                 "pretrained_ebm_pendulum.pth", map_location=device, weights_only=True))
@@ -289,13 +281,12 @@ class WorldModelAgent:
             self.flow.load_state_dict(torch.load(
                 "pretrained_flow_pendulum.pth", map_location=device, weights_only=True))
 
-            # Both EBM and Flow get updated for these agents
             self.wm_optimizer = optim.Adam(
                 list(self.ebm.parameters()) + list(self.flow.parameters()), lr=lr
             )
 
-            # Langevin needs autograd.grad through EBM
-            self._needs_ebm_grad = (agent_type == "EBM (Langevin)")
+            # Both Langevin and IW need EBM gradients for actor signal
+            self._needs_ebm_grad = (agent_type in ("EBM (Langevin)", "EBM (IW)"))
 
         elif agent_type == "Flow":
             self.flow = RealNVP(state_dim, context_dim=state_dim + action_dim, hidden_dim=hd).to(device)
@@ -523,11 +514,10 @@ def train_agent(agent_type, horizon):
     for p in critic_target.parameters():
         p.requires_grad = False
 
-    reward_model = RewardModel(state_dim, action_dim, hidden_dim=CONFIG["HIDDEN_DIM"]).to(device)
-
     actor_opt = optim.Adam(actor.parameters(), lr=CONFIG["LR_ACTOR"])
     critic_opt = optim.Adam(critic.parameters(), lr=CONFIG["LR_CRITIC"])
-    reward_opt = optim.Adam(reward_model.parameters(), lr=CONFIG["LR_REWARD"])
+    
+
 
     buffer = ReplayBuffer(state_dim, action_dim)
     trust_comp = TrustComputer(buffer, CONFIG["TRUST_THRESHOLD"], CONFIG["TRUST_SHARPNESS"])
@@ -582,16 +572,6 @@ def train_agent(agent_type, horizon):
                     parts.append(f"{k}={v:.4f}")
                 print(f"  [WM Update] {' | '.join(parts)}")
 
-        # ==== 3. REWARD MODEL UPDATE (real data, every 5 steps) ====
-        if buffer.size >= CONFIG["BATCH_SIZE"] and total_steps % 5 == 0:
-            _t0 = time.time()
-            batch = buffer.sample(CONFIG["BATCH_SIZE"])
-            pred_r = reward_model(batch["states"], batch["actions"], batch["next_states"])
-            r_loss = F.mse_loss(pred_r, batch["rewards"])
-            reward_opt.zero_grad()
-            r_loss.backward()
-            reward_opt.step()
-            timing["reward_update"].append(time.time() - _t0)
 
         # ==== 4. IMAGINED ROLLOUT + CRITIC + ACTOR (every 5 steps) ====
         if buffer.size >= CONFIG["BATCH_SIZE"] and total_steps % 5 == 0:
@@ -600,10 +580,6 @@ def train_agent(agent_type, horizon):
 
             # Freeze world model so actor/critic gradients don't corrupt it
             agent.freeze_for_rollout()
-
-            # Also freeze reward model during rollout
-            for p in reward_model.parameters():
-                p.requires_grad = False
 
             # --- Imagined rollout for CRITIC ---
             curr = buffer.sample_states(B)
@@ -615,8 +591,12 @@ def train_agent(agent_type, horizon):
                 _tp0 = time.time()
                 ns = agent.predict_next_state(curr, a)
                 _t_predict += time.time() - _tp0
-                r = reward_model(curr, a, ns).squeeze(-1)   # (B,)
-                r = r.clamp(CONFIG["REWARD_CLAMP_MIN"], CONFIG["REWARD_CLAMP_MAX"])
+                # Analytical Pendulum reward: -(theta^2 + 0.1*omega^2 + 0.001*a^2)
+                cos_th = ns[:, 0]
+                sin_th = ns[:, 1]
+                theta_dot = ns[:, 2]
+                theta = torch.atan2(sin_th, cos_th)
+                r = -(theta.pow(2) + 0.1 * theta_dot.pow(2) + 0.001 * a.squeeze(-1).pow(2))
                 w = trust_comp.compute_trust(ns)             # (B, 1)
 
                 i_states.append(curr)
@@ -667,8 +647,11 @@ def train_agent(agent_type, horizon):
                 _tp0 = time.time()
                 ns = agent.predict_next_state(curr_a, a)
                 _t_predict += time.time() - _tp0
-                r = reward_model(curr_a, a, ns).squeeze(-1)  # (B,)
-                r = r.clamp(CONFIG["REWARD_CLAMP_MIN"], CONFIG["REWARD_CLAMP_MAX"])
+                cos_th = ns[:, 0]
+                sin_th = ns[:, 1]
+                theta_dot = ns[:, 2]
+                theta = torch.atan2(sin_th, cos_th)
+                r = -(theta.pow(2) + 0.1 * theta_dot.pow(2) + 0.001 * a.squeeze(-1).pow(2))
                 w = trust_comp.compute_trust(ns).squeeze(-1)  # (B,)
 
                 # Entropy bonus
@@ -696,8 +679,7 @@ def train_agent(agent_type, horizon):
             # Unfreeze everything
             for p in critic.parameters():
                 p.requires_grad = True
-            for p in reward_model.parameters():
-                p.requires_grad = True
+
             agent.unfreeze_after_rollout()
 
             # Polyak
@@ -770,7 +752,7 @@ def main():
     print(f"Critic on imagined data ONLY")
     print(f"{'#'*60}\n")
 
-    agent_types = ["EBM (IW)", "EBM (Langevin)", "EBM (SVGD)", "Flow", "MDN"]
+    agent_types = ["EBM (IW)", "EBM (Langevin)", "Flow", "MDN"]
     horizons = [1, 3, 5]
 
     all_results = {}
