@@ -284,7 +284,7 @@ def svgd_sample(model, state, action, init_state=None,
 
     B = state.shape[0]
     D = state.shape[1]
-    N = cfg.get("SVGD_NUM_PARTICLES", 32)
+    N = cfg.get("SVGD_NUM_PARTICLES", 10)
     n_steps = cfg.get("SVGD_STEPS", 20)
     step_size = cfg.get("SVGD_STEP_SIZE", 0.01)
     bandwidth = cfg.get("SVGD_BANDWIDTH", None)  # None = median heuristic
