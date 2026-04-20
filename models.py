@@ -319,6 +319,33 @@ class MixtureDensityNetwork(nn.Module):
         return torch.logsumexp(log_pi + log_prob_components, dim=1)  # (B,)
 
 
+class DirectNN(nn.Module):
+    """
+    Direct neural network world model: s' = f(s, a).
+    Simple MLP baseline — no flow, no EBM, no mixture.
+    Directly regresses next state from (state, action).
+    """
+    def __init__(self, state_dim, action_dim, hidden_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim + action_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, state_dim)
+        )
+
+    def forward(self, state, action):
+        x = torch.cat([state, action], dim=-1)
+        return self.net(x)
+
+    def sample_differentiable(self, state, action):
+        """Interface compatibility — just forward pass."""
+        return self.forward(state, action)
+
+
 class RewardModel(nn.Module):
     """
     Transition reward model r(s, a, s').

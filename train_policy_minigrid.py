@@ -11,10 +11,17 @@ Agents:
   3. EBM (SVGD)      — EBM SVGD refinement (mode-covering particles)
   4. Flow            — RealNVP direct sampling
   5. MDN             — Mixture Density Network direct sampling
+  6. Direct          — Simple NN regression baseline (no flow/EBM/mixture)
 
-Environment: MiniGrid-Dynamic-Obstacles-8x8 with 1 moving obstacle.
+Environment: MiniGrid-Dynamic-Obstacles-8x8 with 3 moving obstacles.
   Genuine environment-side stochasticity from obstacle movement.
   state_dim=15, action_dim=3.
+
+Changes from original:
+  - Added Direct NN baseline (simple MLP world model)
+  - Multi-seed runs (NUM_SEEDS=3) with mean +/- std plots
+  - Reward model accuracy validation (analytical vs learned)
+  - Detailed computational cost breakdown per component
 
 Outputs:
   minigrid_convergence.png, minigrid_trust.png, minigrid_mse.png,
@@ -32,7 +39,7 @@ from copy import deepcopy
 
 from models import (
     Actor, ValueNetwork, BilinearEBM, RealNVP,
-    MixtureDensityNetwork, RewardModel
+    MixtureDensityNetwork, RewardModel, DirectNN
 )
 from utils_sampling import importance_weighted_sample, langevin_refine, svgd_sample
 from minigrid_env import (
@@ -46,7 +53,7 @@ from minigrid_env import (
 CONFIG = {
     # --- Environment ---
     "GRID_SIZE": 8,
-    "N_OBSTACLES": 1,
+    "N_OBSTACLES": 3,
     "SLIP_PROB": 0.1,
     "MAX_STEPS": 100,
     "ACTION_SCALE": 1.0,
@@ -54,6 +61,10 @@ CONFIG = {
     # --- Training ---
     "TOTAL_STEPS": 50000,
     "BATCH_SIZE": 256,
+
+    # --- Multi-seed ---
+    "NUM_SEEDS": 3,
+    "SEEDS": [42, 123, 7],
 
     # --- RL ---
     "DISCOUNT": 0.99,
@@ -165,7 +176,7 @@ class ReplayBuffer:
 
 
 # =============================================================================
-# TRUST / TD(λ) / DIAGNOSTICS  (unchanged — work on any dim)
+# TRUST / TD(lambda) / DIAGNOSTICS  (unchanged — work on any dim)
 # =============================================================================
 class TrustComputer:
     def __init__(self, buffer, threshold=3.0, sharpness=2.0):
@@ -219,6 +230,62 @@ def evaluate_prediction_accuracy(agent, buffer, num_samples=512):
 
 
 # =============================================================================
+# REWARD MODEL ACCURACY — ONE-TIME SANITY CHECK
+# =============================================================================
+def reward_sanity_check(num_samples=2000):
+    """
+    One-time check that minigrid_analytical_reward matches real env rewards.
+    Run once before training. If this fails, imagined rollouts optimize
+    the wrong objective.
+
+    Returns dict with mae, corr, sign_agreement, or None on failure.
+    """
+    env = make_minigrid_env(
+        size=CONFIG["GRID_SIZE"], n_obstacles=CONFIG["N_OBSTACLES"],
+        slip_prob=CONFIG["SLIP_PROB"], max_steps=CONFIG["MAX_STEPS"])
+    device = CONFIG["DEVICE"]
+
+    states, actions, next_states, rewards = [], [], [], []
+    state, _ = env.reset()
+    for _ in range(num_samples):
+        a_int = env.action_space.sample()
+        ns, r, term, trunc, _ = env.step(a_int)
+        states.append(state)
+        actions.append(discrete_to_onehot(a_int, env.action_dim))
+        next_states.append(ns)
+        rewards.append(r)
+        if term or trunc:
+            state, _ = env.reset()
+        else:
+            state = ns
+    env.close()
+
+    s = torch.tensor(np.array(states), device=device)
+    a = torch.tensor(np.array(actions), device=device)
+    ns = torch.tensor(np.array(next_states), device=device)
+    actual = torch.tensor(np.array(rewards), device=device)
+
+    with torch.no_grad():
+        analytical = minigrid_analytical_reward(s, ns, a)
+
+    diff = analytical - actual
+    mae = diff.abs().mean().item()
+    mse = (diff ** 2).mean().item()
+
+    a_mean, p_mean = actual.mean(), analytical.mean()
+    cov = ((actual - a_mean) * (analytical - p_mean)).mean()
+    corr = (cov / (actual.std() * analytical.std() + 1e-8)).item()
+    sign_agree = ((actual > 0) == (analytical > 0)).float().mean().item()
+
+    return {
+        "mae": mae, "rmse": mse ** 0.5, "corr": corr,
+        "sign_agreement": sign_agree,
+        "actual_mean": actual.mean().item(),
+        "analytical_mean": analytical.mean().item(),
+    }
+
+
+# =============================================================================
 # WORLD MODEL AGENT
 # =============================================================================
 class WorldModelAgent:
@@ -230,6 +297,7 @@ class WorldModelAgent:
         self.ebm = None
         self.flow = None
         self.mdn = None
+        self.direct = None
         self.wm_optimizer = None
 
         hd = CONFIG["HIDDEN_DIM"]
@@ -269,6 +337,12 @@ class WorldModelAgent:
             self.mdn.load_state_dict(torch.load(
                 "pretrained_mdn_minigrid.pth", map_location=device, weights_only=True))
             self.wm_optimizer = optim.Adam(self.mdn.parameters(), lr=lr)
+
+        elif agent_type == "Direct":
+            self.direct = DirectNN(state_dim, action_dim, hidden_dim=hd).to(device)
+            self.direct.load_state_dict(torch.load(
+                "pretrained_direct_minigrid.pth", map_location=device, weights_only=True))
+            self.wm_optimizer = optim.Adam(self.direct.parameters(), lr=lr)
 
     def update_world_model(self, buffer):
         BS = CONFIG["WM_UPDATE_BATCH"]
@@ -311,14 +385,23 @@ class WorldModelAgent:
             total_loss = total_loss + mdn_loss
             with torch.no_grad(): metrics["mdn_loss"] = mdn_loss.item()
 
+        if self.direct is not None:
+            self.direct.train()
+            pred = self.direct(s, a)
+            direct_loss = F.mse_loss(pred, ns)
+            total_loss = total_loss + direct_loss
+            with torch.no_grad(): metrics["direct_loss"] = direct_loss.item()
+
         total_loss.backward()
         if self.ebm: torch.nn.utils.clip_grad_norm_(self.ebm.parameters(), 1.0)
         if self.flow: torch.nn.utils.clip_grad_norm_(self.flow.parameters(), 1.0)
         if self.mdn: torch.nn.utils.clip_grad_norm_(self.mdn.parameters(), 1.0)
+        if self.direct: torch.nn.utils.clip_grad_norm_(self.direct.parameters(), 1.0)
         self.wm_optimizer.step()
         if self.ebm: self.ebm.eval()
         if self.flow: self.flow.eval()
         if self.mdn: self.mdn.eval()
+        if self.direct: self.direct.eval()
         return metrics
 
     def freeze_for_rollout(self):
@@ -328,9 +411,11 @@ class WorldModelAgent:
             for p in self.flow.parameters(): p.requires_grad = False
         if self.mdn:
             for p in self.mdn.parameters(): p.requires_grad = False
+        if self.direct:
+            for p in self.direct.parameters(): p.requires_grad = False
 
     def unfreeze_after_rollout(self):
-        for m in [self.ebm, self.flow, self.mdn]:
+        for m in [self.ebm, self.flow, self.mdn, self.direct]:
             if m:
                 for p in m.parameters(): p.requires_grad = True
         self.wm_optimizer.zero_grad()
@@ -372,8 +457,20 @@ class WorldModelAgent:
 
         elif self.agent_type == "MDN":
             return self.mdn.sample_differentiable(state, action)
+
+        elif self.agent_type == "Direct":
+            return self.direct(state, action)
+
         else:
             raise ValueError(f"Unknown: {self.agent_type}")
+
+    def count_parameters(self):
+        """Count total trainable parameters in world model components."""
+        total = 0
+        for m in [self.ebm, self.flow, self.mdn, self.direct]:
+            if m is not None:
+                total += sum(p.numel() for p in m.parameters() if p.requires_grad)
+        return total
 
 
 # =============================================================================
@@ -406,10 +503,17 @@ def evaluate_policy(actor, num_episodes=10):
 
 
 # =============================================================================
-# TRAIN ONE AGENT
+# TRAIN ONE AGENT (single seed)
 # =============================================================================
-def train_agent(agent_type, horizon):
+def train_agent(agent_type, horizon, seed=42):
     device = CONFIG["DEVICE"]
+
+    # Set all seeds
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+
     env = make_minigrid_env(
         size=CONFIG["GRID_SIZE"], n_obstacles=CONFIG["N_OBSTACLES"],
         slip_prob=CONFIG["SLIP_PROB"], max_steps=CONFIG["MAX_STEPS"])
@@ -417,7 +521,7 @@ def train_agent(agent_type, horizon):
     action_dim = env.action_dim
 
     print(f"\n{'='*60}")
-    print(f"Agent: {agent_type} | Horizon: {horizon}")
+    print(f"Agent: {agent_type} | Horizon: {horizon} | Seed: {seed}")
     print(f"state_dim={state_dim}, action_dim={action_dim}")
     print(f"{'='*60}")
 
@@ -433,6 +537,10 @@ def train_agent(agent_type, horizon):
     buffer = ReplayBuffer(state_dim, action_dim)
     trust_comp = TrustComputer(buffer, CONFIG["TRUST_THRESHOLD"], CONFIG["TRUST_SHARPNESS"])
 
+    # Log parameter count
+    wm_params = agent.count_parameters()
+    print(f"World model parameters: {wm_params:,}")
+
     print("Collecting 2000 random transitions...")
     state, _ = env.reset()
     for _ in range(2000):
@@ -443,8 +551,11 @@ def train_agent(agent_type, horizon):
 
     eval_steps, eval_rewards = [], []
     diag_log, trust_log = [], []
-    timing = {"wm_update": [], "reward_update": [], "rollout_predict": [],
-              "critic_update": [], "actor_update": [], "eval": [], "wall_clock": []}
+    timing = {
+        "wm_update": [], "reward_update": [], "rollout_predict": [],
+        "critic_update": [], "actor_update": [], "eval": [], "wall_clock": [],
+        "total_predict_calls": 0,
+    }
     train_start_time = time.time()
 
     state, _ = env.reset()
@@ -489,6 +600,8 @@ def train_agent(agent_type, horizon):
                 i_next.append(ns); i_trust.append(w)
                 curr = ns
 
+            timing["total_predict_calls"] += H
+
             rew_t = torch.stack(i_rewards, dim=1)
             ns_t = torch.stack(i_next, dim=1)
             st_t = torch.stack(i_states, dim=1)
@@ -523,6 +636,9 @@ def train_agent(agent_type, horizon):
                 ret = ret + disc * (r + CONFIG["ENTROPY_COEFF"] * ent)
                 disc = disc * CONFIG["DISCOUNT"] * w
                 curr_a = ns
+
+            timing["total_predict_calls"] += H
+
             ret = ret + disc * critic(curr_a).squeeze(-1)
             actor_loss = -ret.mean()
             actor_opt.zero_grad(); actor_loss.backward()
@@ -562,12 +678,12 @@ def train_agent(agent_type, horizon):
             eval_rewards.append(em)
             n_ep = CONFIG["EVAL_EPISODES"]
             print(f"Step {total_steps}/{CONFIG['TOTAL_STEPS']} | "
-                  f"Eval: {em:.1f} ± {es:.1f} | "
+                  f"Eval: {em:.1f} +/- {es:.1f} | "
                   f"Goals: {goals}/{n_ep} | Collisions: {cols}/{n_ep}")
 
     env.close()
     total_wall = time.time() - train_start_time
-    print(f"\n  [{agent_type} H={horizon}] Wall time: {total_wall:.1f}s")
+    print(f"\n  [{agent_type} H={horizon} seed={seed}] Wall time: {total_wall:.1f}s")
 
     def _mean(lst): return np.mean(lst) if lst else 0.0
     def _sum(lst): return np.sum(lst) if lst else 0.0
@@ -576,10 +692,82 @@ def train_agent(agent_type, horizon):
     print(f"    wm:      {_sum(timing['wm_update']):.1f}s")
     print(f"    critic:  {_sum(timing['critic_update']):.1f}s")
     print(f"    actor:   {_sum(timing['actor_update']):.1f}s")
+    print(f"    total predict calls: {timing['total_predict_calls']}")
+    print(f"    WM parameters: {wm_params:,}")
 
     return {"eval_steps": eval_steps, "eval_rewards": eval_rewards,
             "diagnostic_log": diag_log, "rollout_quality_log": trust_log,
-            "timing": timing, "total_wall_time": total_wall}
+            "timing": timing, "total_wall_time": total_wall,
+            "wm_params": wm_params}
+
+
+# =============================================================================
+# MULTI-SEED AGGREGATION
+# =============================================================================
+def aggregate_seeds(seed_results):
+    """
+    Aggregate results across seeds into mean +/- std.
+
+    Args:
+        seed_results: list of dicts from train_agent (one per seed)
+
+    Returns:
+        dict with eval_steps, eval_rewards_mean, eval_rewards_std,
+        and aggregated timing/diagnostic info
+    """
+    if not seed_results:
+        return None
+
+    # Use the eval_steps from the first seed as reference
+    ref_steps = seed_results[0]["eval_steps"]
+
+    # Interpolate all seeds to same steps and compute mean/std
+    all_rewards = []
+    for r in seed_results:
+        if len(r["eval_steps"]) == len(ref_steps):
+            all_rewards.append(r["eval_rewards"])
+        else:
+            interp = np.interp(ref_steps, r["eval_steps"], r["eval_rewards"])
+            all_rewards.append(interp.tolist())
+
+    all_rewards = np.array(all_rewards)  # (num_seeds, num_eval_points)
+    mean_rewards = all_rewards.mean(axis=0)
+    std_rewards = all_rewards.std(axis=0)
+
+    # Aggregate timing across seeds (take mean)
+    avg_wall = np.mean([r["total_wall_time"] for r in seed_results])
+
+    # Detailed timing aggregation
+    timing_agg = {}
+    for key in ["wm_update", "critic_update", "actor_update", "rollout_predict"]:
+        per_seed_totals = [np.sum(r["timing"][key]) if r["timing"][key] else 0
+                           for r in seed_results]
+        timing_agg[f"{key}_mean"] = np.mean(per_seed_totals)
+        timing_agg[f"{key}_std"] = np.std(per_seed_totals)
+
+    # Per-call predict cost
+    avg_predict_ms = np.mean([
+        np.mean(r["timing"]["rollout_predict"]) * 1000
+        if r["timing"]["rollout_predict"] else 0
+        for r in seed_results
+    ])
+    avg_predict_std_ms = np.std([
+        np.mean(r["timing"]["rollout_predict"]) * 1000
+        if r["timing"]["rollout_predict"] else 0
+        for r in seed_results
+    ])
+
+    return {
+        "eval_steps": ref_steps,
+        "eval_rewards_mean": mean_rewards.tolist(),
+        "eval_rewards_std": std_rewards.tolist(),
+        "total_wall_time_mean": avg_wall,
+        "avg_predict_ms": avg_predict_ms,
+        "avg_predict_std_ms": avg_predict_std_ms,
+        "timing_agg": timing_agg,
+        "wm_params": seed_results[0].get("wm_params", 0),
+        "seed_results": seed_results,
+    }
 
 
 # =============================================================================
@@ -591,26 +779,52 @@ def main():
     print(f"Grid: {CONFIG['GRID_SIZE']}x{CONFIG['GRID_SIZE']}, "
           f"obstacles={CONFIG['N_OBSTACLES']}, slip={CONFIG['SLIP_PROB']}")
     print(f"Critic on imagined data ONLY")
+    print(f"Seeds: {CONFIG['SEEDS']}")
     print(f"{'#'*60}\n")
 
-    agent_types = ["EBM (IW)", "EBM (Langevin)", "Flow", "MDN"]
+    agent_types = ["Direct", "EBM (IW)", "EBM (Langevin)", "MDN", "EBM (SVGD)"]
     horizons = [1, 3, 5]
+    seeds = CONFIG["SEEDS"]
+
+    # --- One-time reward sanity check ---
+    print("Running reward sanity check (analytical vs env)...")
+    rsc = reward_sanity_check(num_samples=2000)
+    print(f"  MAE={rsc['mae']:.4f} | RMSE={rsc['rmse']:.4f} | "
+          f"Corr={rsc['corr']:.4f} | Sign agree={rsc['sign_agreement']:.2%}")
+    print(f"  Env mean={rsc['actual_mean']:.4f} | "
+          f"Analytical mean={rsc['analytical_mean']:.4f}")
+    if rsc["corr"] < 0.9:
+        print("  WARNING: Low correlation — analytical reward may not match env!")
+    else:
+        print("  OK: Analytical reward matches env rewards.")
+    print()
 
     all_results = {}
     for horizon in horizons:
         for agent_type in agent_types:
             key = f"{agent_type} H={horizon}"
-            try:
-                all_results[key] = train_agent(agent_type, horizon)
-            except Exception as e:
-                print(f"!!! FAILED: {key} -- {e}")
-                import traceback; traceback.print_exc()
+            seed_runs = []
+            for seed in seeds:
+                try:
+                    result = train_agent(agent_type, horizon, seed=seed)
+                    seed_runs.append(result)
+                except Exception as e:
+                    print(f"!!! FAILED: {key} seed={seed} -- {e}")
+                    import traceback; traceback.print_exc()
 
-    # ===== PLOTTING (identical structure, updated filenames/titles) =====
-    colors = {"EBM (IW)": "tab:red", "EBM (Langevin)": "tab:orange",
-              "EBM (SVGD)": "tab:purple", "Flow": "tab:blue", "MDN": "tab:green"}
+            if seed_runs:
+                all_results[key] = aggregate_seeds(seed_runs)
 
-    # Plot 1: Convergence
+    # ===== PLOTTING =====
+    colors = {
+        "EBM (IW)": "tab:red", "EBM (Langevin)": "tab:orange",
+        "EBM (SVGD)": "tab:purple", "Flow": "tab:blue",
+        "MDN": "tab:green", "Direct": "tab:brown",
+    }
+
+    # -------------------------------------------------------------------------
+    # Plot 1: Convergence (with shaded std bands)
+    # -------------------------------------------------------------------------
     fig, axes = plt.subplots(1, len(horizons), figsize=(6*len(horizons), 5), sharey=True)
     if len(horizons) == 1: axes = [axes]
     for i, h in enumerate(horizons):
@@ -622,17 +836,24 @@ def main():
             k = f"{at} H={h}"
             if k in all_results:
                 d = all_results[k]
-                ax.plot(d["eval_steps"], d["eval_rewards"],
-                        label=at, color=colors[at], linewidth=2)
+                steps = d["eval_steps"]
+                mean = np.array(d["eval_rewards_mean"])
+                std = np.array(d["eval_rewards_std"])
+                ax.plot(steps, mean, label=at, color=colors[at], linewidth=2)
+                ax.fill_between(steps, mean - std, mean + std,
+                                color=colors[at], alpha=0.15)
         ax.legend(fontsize=9)
     plt.suptitle(f"Policy Convergence — Dynamic-Obstacles-{CONFIG['GRID_SIZE']}x{CONFIG['GRID_SIZE']} "
-                 f"({CONFIG['N_OBSTACLES']} obs, slip={CONFIG['SLIP_PROB']})",
+                 f"({CONFIG['N_OBSTACLES']} obs, slip={CONFIG['SLIP_PROB']}) "
+                 f"[{len(seeds)} seeds]",
                  fontsize=13, fontweight="bold")
     plt.tight_layout()
     plt.savefig("minigrid_convergence.png", dpi=200, bbox_inches="tight")
     print("\nSaved: minigrid_convergence.png")
 
-    # Plot 2: Trust
+    # -------------------------------------------------------------------------
+    # Plot 2: Trust (use first seed for trust curves)
+    # -------------------------------------------------------------------------
     fig2, axes2 = plt.subplots(1, len(horizons), figsize=(6*len(horizons), 4), sharey=True)
     if len(horizons) == 1: axes2 = [axes2]
     for i, h in enumerate(horizons):
@@ -642,94 +863,193 @@ def main():
         if i == 0: ax.set_ylabel("% Trusted Steps")
         for at in agent_types:
             k = f"{at} H={h}"
-            if k in all_results and all_results[k]["rollout_quality_log"]:
-                rq = all_results[k]["rollout_quality_log"]
-                ax.plot([r["step"] for r in rq], [r["pct_trusted"] for r in rq],
-                        label=at, color=colors[at], linewidth=2)
+            if k in all_results:
+                sr = all_results[k]["seed_results"][0]
+                if sr["rollout_quality_log"]:
+                    rq = sr["rollout_quality_log"]
+                    ax.plot([r["step"] for r in rq], [r["pct_trusted"] for r in rq],
+                            label=at, color=colors[at], linewidth=2)
         ax.legend(fontsize=9)
     plt.suptitle("Rollout Quality Over Training", fontsize=13, fontweight="bold")
     plt.tight_layout()
     plt.savefig("minigrid_trust.png", dpi=200, bbox_inches="tight")
     print("Saved: minigrid_trust.png")
 
+    # -------------------------------------------------------------------------
     # Plot 3: MSE
+    # -------------------------------------------------------------------------
     fig3, ax3 = plt.subplots(figsize=(8, 5))
     ax3.set_title("1-Step Prediction MSE", fontsize=12, fontweight="bold")
     ax3.set_xlabel("Steps"); ax3.set_ylabel("MSE"); ax3.set_yscale("log"); ax3.grid(True, alpha=0.3)
     for at in agent_types:
         k = f"{at} H=1"
-        if k in all_results and all_results[k]["diagnostic_log"]:
-            dl = all_results[k]["diagnostic_log"]
-            ax3.plot([d["step"] for d in dl], [d["mse"] for d in dl],
-                     label=at, color=colors[at], linewidth=2)
+        if k in all_results:
+            sr = all_results[k]["seed_results"][0]
+            if sr["diagnostic_log"]:
+                dl = sr["diagnostic_log"]
+                ax3.plot([d["step"] for d in dl], [d["mse"] for d in dl],
+                         label=at, color=colors[at], linewidth=2)
     ax3.legend(fontsize=10)
     plt.tight_layout()
     plt.savefig("minigrid_mse.png", dpi=200, bbox_inches="tight")
     print("Saved: minigrid_mse.png")
 
-    # Plot 4: Compute cost
-    fig4, (ax4a, ax4b) = plt.subplots(1, 2, figsize=(14, 6))
+    # -------------------------------------------------------------------------
+    # Plot 4: Compute cost (ENHANCED — 2x2 grid)
+    # -------------------------------------------------------------------------
+    fig4, axes4 = plt.subplots(2, 2, figsize=(16, 12))
     timing_horizon = 3 if 3 in horizons else horizons[0]
-    bar_agents, bar_wall, bar_predict, bar_critic = [], [], [], []
-    bar_actor, bar_wm, bar_other = [], [], []
+
+    # --- 4a: Wall-clock breakdown (stacked bar) ---
+    ax4a = axes4[0, 0]
+    bar_agents, bar_wall = [], []
+    bar_predict, bar_critic, bar_actor, bar_wm, bar_other = [], [], [], [], []
     per_step_predict_mean, per_step_predict_std = [], []
+    bar_params = []
     for at in agent_types:
         k = f"{at} H={timing_horizon}"
-        if k not in all_results or "timing" not in all_results[k]: continue
-        t = all_results[k]["timing"]
-        total_w = all_results[k].get("total_wall_time", 0)
-        t_predict = np.sum(t["rollout_predict"]) if t["rollout_predict"] else 0
-        t_critic = np.sum(t["critic_update"]) if t["critic_update"] else 0
-        t_actor = np.sum(t["actor_update"]) if t["actor_update"] else 0
-        t_wm = np.sum(t["wm_update"]) if t["wm_update"] else 0
+        if k not in all_results: continue
+        d = all_results[k]
+        ta = d.get("timing_agg", {})
+        total_w = d.get("total_wall_time_mean", 0)
+        t_predict = ta.get("rollout_predict_mean", 0)
+        t_critic = ta.get("critic_update_mean", 0)
+        t_actor = ta.get("actor_update_mean", 0)
+        t_wm = ta.get("wm_update_mean", 0)
+
         bar_agents.append(at); bar_wall.append(total_w)
         bar_predict.append(t_predict); bar_critic.append(t_critic)
         bar_actor.append(t_actor); bar_wm.append(t_wm)
         bar_other.append(max(total_w - t_predict - t_critic - t_actor - t_wm, 0))
-        if t["rollout_predict"]:
-            per_step_predict_mean.append(np.mean(t["rollout_predict"]) * 1000)
-            per_step_predict_std.append(np.std(t["rollout_predict"]) * 1000)
-        else:
-            per_step_predict_mean.append(0); per_step_predict_std.append(0)
+        bar_params.append(d.get("wm_params", 0))
+        per_step_predict_mean.append(d.get("avg_predict_ms", 0))
+        per_step_predict_std.append(d.get("avg_predict_std_ms", 0))
+
     if bar_agents:
         x = np.arange(len(bar_agents)); width = 0.6
         ax4a.bar(x, bar_predict, width, label="predict", color="tab:red", alpha=0.85)
-        ax4a.bar(x, bar_actor, width, bottom=np.array(bar_predict), label="actor", color="tab:orange", alpha=0.85)
-        ax4a.bar(x, bar_critic, width, bottom=np.array(bar_predict)+np.array(bar_actor), label="critic", color="tab:blue", alpha=0.85)
-        ax4a.bar(x, bar_wm, width, bottom=np.array(bar_predict)+np.array(bar_actor)+np.array(bar_critic), label="WM", color="tab:green", alpha=0.85)
-        ax4a.bar(x, bar_other, width, bottom=np.array(bar_predict)+np.array(bar_actor)+np.array(bar_critic)+np.array(bar_wm), label="other", color="tab:gray", alpha=0.5)
-        ax4a.set_xticks(x); ax4a.set_xticklabels(bar_agents, rotation=20, ha="right", fontsize=9)
-        ax4a.set_ylabel("Time (s)"); ax4a.set_title(f"Wall-Clock Breakdown (H={timing_horizon})", fontweight="bold")
+        ax4a.bar(x, bar_actor, width, bottom=np.array(bar_predict),
+                 label="actor", color="tab:orange", alpha=0.85)
+        ax4a.bar(x, bar_critic, width,
+                 bottom=np.array(bar_predict)+np.array(bar_actor),
+                 label="critic", color="tab:blue", alpha=0.85)
+        ax4a.bar(x, bar_wm, width,
+                 bottom=np.array(bar_predict)+np.array(bar_actor)+np.array(bar_critic),
+                 label="WM update", color="tab:green", alpha=0.85)
+        ax4a.bar(x, bar_other, width,
+                 bottom=np.array(bar_predict)+np.array(bar_actor)+np.array(bar_critic)+np.array(bar_wm),
+                 label="other", color="tab:gray", alpha=0.5)
+        ax4a.set_xticks(x)
+        ax4a.set_xticklabels(bar_agents, rotation=20, ha="right", fontsize=9)
+        ax4a.set_ylabel("Time (s)")
+        ax4a.set_title(f"Wall-Clock Breakdown (H={timing_horizon}, avg {len(seeds)} seeds)",
+                       fontweight="bold")
         ax4a.legend(fontsize=8); ax4a.grid(True, alpha=0.3, axis="y")
-        for i, tw in enumerate(bar_wall):
-            ax4a.text(i, tw+0.5, f"{tw:.0f}s", ha="center", fontsize=9, fontweight="bold")
+        for i_bar, tw in enumerate(bar_wall):
+            ax4a.text(i_bar, tw+0.5, f"{tw:.0f}s", ha="center", fontsize=9, fontweight="bold")
+
+    # --- 4b: Per-call predict cost ---
+    ax4b = axes4[0, 1]
+    if bar_agents:
         bar_colors = [colors.get(at, "tab:gray") for at in bar_agents]
-        ax4b.bar(x, per_step_predict_mean, width, yerr=per_step_predict_std, color=bar_colors, alpha=0.85, capsize=4)
-        ax4b.set_xticks(x); ax4b.set_xticklabels(bar_agents, rotation=20, ha="right", fontsize=9)
-        ax4b.set_ylabel("Time (ms)"); ax4b.set_title(f"Per-Call predict Cost (H={timing_horizon})", fontweight="bold")
+        ax4b.bar(x, per_step_predict_mean, width, yerr=per_step_predict_std,
+                 color=bar_colors, alpha=0.85, capsize=4)
+        ax4b.set_xticks(x)
+        ax4b.set_xticklabels(bar_agents, rotation=20, ha="right", fontsize=9)
+        ax4b.set_ylabel("Time (ms)")
+        ax4b.set_title(f"Per-Call Predict Cost (H={timing_horizon})", fontweight="bold")
         ax4b.grid(True, alpha=0.3, axis="y")
-    plt.suptitle("Computational Cost", fontsize=13, fontweight="bold")
+        for i_bar, (m, s) in enumerate(zip(per_step_predict_mean, per_step_predict_std)):
+            ax4b.text(i_bar, m + s + 0.1, f"{m:.2f}ms", ha="center", fontsize=8)
+
+    # --- 4c: Parameter count comparison ---
+    ax4c = axes4[1, 0]
+    if bar_agents:
+        param_colors = [colors.get(at, "tab:gray") for at in bar_agents]
+        ax4c.bar(x, [p / 1000 for p in bar_params], width,
+                 color=param_colors, alpha=0.85)
+        ax4c.set_xticks(x)
+        ax4c.set_xticklabels(bar_agents, rotation=20, ha="right", fontsize=9)
+        ax4c.set_ylabel("Parameters (K)")
+        ax4c.set_title("World Model Parameter Count", fontweight="bold")
+        ax4c.grid(True, alpha=0.3, axis="y")
+        for i_bar, p in enumerate(bar_params):
+            ax4c.text(i_bar, p/1000 + 0.5, f"{p:,}", ha="center", fontsize=8)
+
+    # --- 4d: Cost-efficiency (reward per second) ---
+    ax4d = axes4[1, 1]
+    if bar_agents:
+        final_rewards = []
+        for at in bar_agents:
+            k = f"{at} H={timing_horizon}"
+            if k in all_results:
+                d = all_results[k]
+                final_rewards.append(d["eval_rewards_mean"][-1] if d["eval_rewards_mean"] else 0)
+            else:
+                final_rewards.append(0)
+        efficiency = [r / max(w, 1) for r, w in zip(final_rewards, bar_wall)]
+        bar_colors = [colors.get(at, "tab:gray") for at in bar_agents]
+        ax4d.bar(x, efficiency, width, color=bar_colors, alpha=0.85)
+        ax4d.set_xticks(x)
+        ax4d.set_xticklabels(bar_agents, rotation=20, ha="right", fontsize=9)
+        ax4d.set_ylabel("Final Reward / Wall Time (reward/s)")
+        ax4d.set_title("Cost-Efficiency", fontweight="bold")
+        ax4d.grid(True, alpha=0.3, axis="y")
+
+    plt.suptitle("Computational Cost Analysis", fontsize=13, fontweight="bold")
     plt.tight_layout()
     plt.savefig("minigrid_compute.png", dpi=200, bbox_inches="tight")
     print("Saved: minigrid_compute.png")
 
-    # Plot 5: Wall-clock
+    # -------------------------------------------------------------------------
+    # Plot 5: Wall-clock (reward vs wall time)
+    # -------------------------------------------------------------------------
     fig5, ax5 = plt.subplots(figsize=(8, 5))
     ax5.set_title(f"Reward vs Wall Time (H={timing_horizon})", fontweight="bold")
     ax5.set_xlabel("Wall Time (s)"); ax5.set_ylabel("Eval Reward"); ax5.grid(True, alpha=0.3)
     for at in agent_types:
         k = f"{at} H={timing_horizon}"
-        if k not in all_results or "timing" not in all_results[k]: continue
-        d = all_results[k]; wc = d["timing"]["wall_clock"]
-        if not wc or not d["eval_steps"]: continue
+        if k not in all_results: continue
+        d = all_results[k]
+        sr = d["seed_results"][0]
+        wc = sr["timing"]["wall_clock"]
+        if not wc or not sr["eval_steps"]: continue
         wc_steps = [w["step"] for w in wc]; wc_times = [w["elapsed"] for w in wc]
         if len(wc_steps) >= 2:
-            eval_times = np.interp(d["eval_steps"], wc_steps, wc_times)
-            ax5.plot(eval_times, d["eval_rewards"], label=at, color=colors[at], linewidth=2)
+            eval_times = np.interp(sr["eval_steps"], wc_steps, wc_times)
+            mean_rewards = np.array(d["eval_rewards_mean"])
+            std_rewards = np.array(d["eval_rewards_std"])
+            ax5.plot(eval_times, mean_rewards, label=at, color=colors[at], linewidth=2)
+            ax5.fill_between(eval_times, mean_rewards - std_rewards,
+                             mean_rewards + std_rewards, color=colors[at], alpha=0.15)
     ax5.legend(fontsize=10)
     plt.tight_layout()
     plt.savefig("minigrid_wallclock.png", dpi=200, bbox_inches="tight")
     print("Saved: minigrid_wallclock.png")
+
+    # -------------------------------------------------------------------------
+    # Print detailed compute table
+    # -------------------------------------------------------------------------
+    print(f"\n{'='*90}")
+    print(f"DETAILED COMPUTATIONAL COST TABLE (H={timing_horizon}, {len(seeds)} seeds)")
+    print(f"{'='*90}")
+    print(f"{'Agent':<18} {'Params':>10} {'Wall(s)':>10} {'Predict(s)':>12} "
+          f"{'WM(s)':>10} {'Critic(s)':>10} {'Actor(s)':>10} {'ms/pred':>10}")
+    print("-" * 90)
+    for at in agent_types:
+        k = f"{at} H={timing_horizon}"
+        if k not in all_results: continue
+        d = all_results[k]
+        ta = d.get("timing_agg", {})
+        print(f"{at:<18} "
+              f"{d.get('wm_params', 0):>10,} "
+              f"{d.get('total_wall_time_mean', 0):>10.1f} "
+              f"{ta.get('rollout_predict_mean', 0):>12.1f} "
+              f"{ta.get('wm_update_mean', 0):>10.1f} "
+              f"{ta.get('critic_update_mean', 0):>10.1f} "
+              f"{ta.get('actor_update_mean', 0):>10.1f} "
+              f"{d.get('avg_predict_ms', 0):>10.2f}")
+    print(f"{'='*90}")
 
     np.save("minigrid_results.npy", all_results, allow_pickle=True)
     print("Saved: minigrid_results.npy\nDone!")
